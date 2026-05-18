@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ClusterKit</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="roleGate" class="role-gate hidden">
+    <div class="role-panel">
+      <p class="eyebrow">ClusterKit старт</p>
+      <h1>Цей компʼютер — хто?</h1>
+      <p class="muted">Worker віддає ресурси. Coordinator знаходить worker-и, запускає модель і дає чат/API.</p>
+      <div class="role-actions">
+        <button class="primary big" onclick="chooseRole('worker')">Worker</button>
+        <button class="primary big" onclick="chooseRole('coordinator')">Coordinator</button>
+      </div>
+    </div>
+  </div>
+
+  <main>
+    <section class="hero">
+      <div>
+        <p class="eyebrow">LLM LAN Cluster</p>
+        <h1>ClusterKit</h1>
+        <p class="muted" id="roleSubtitle">...</p>
+      </div>
+      <div class="status-card">
+        <div class="row tight">
+          <div class="pill" id="os">...</div>
+          <button onclick="openSettings()">⚙ Налаштування</button>
+        </div>
+        <div>Роль: <strong id="roleLabel">...</strong> <button class="small" onclick="showRoleGate(true)">змінити</button></div>
+        <div>IP: <strong id="localIP">...</strong></div>
+        <div>llama.cpp: <strong id="llamaReady">...</strong></div>
+        <div>Models: <small id="modelsDir">...</small></div>
+        <div>Hardware: <small id="hardwareInfo">...</small></div>
+      </div>
+    </section>
+
+    <section id="workerUI" class="role-ui hidden">
+      <section class="card focus-card">
+        <div>
+          <h2>Worker</h2>
+          <p class="muted">RPC worker запускається автоматично. Coordinator знайде його в локальній мережі.</p>
+        </div>
+        <div class="actions">
+          <button class="primary" onclick="startWorker()">Старт worker</button>
+          <button onclick="stopWorker()">Стоп worker</button>
+          <button onclick="clearLocalModelCache()">Очистити model cache</button>
+        </div>
+        <p id="workerState" class="state">...</p>
+      </section>
+    </section>
+
+    <section id="coordinatorUI" class="role-ui hidden">
+      <section class="card">
+        <div class="row">
+          <div>
+            <h2>Workers</h2>
+            <p class="muted">Ручного додавання більше нема. Тільки auto-discover.</p>
+          </div>
+          <div class="actions compact">
+            <button class="primary" onclick="discoverWorkers()">Знайти workers</button>
+            <button onclick="checkWorkers()">Перевірити</button>
+          </div>
+        </div>
+        <div id="workers" class="worker-list"></div>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <div>
+            <h2>Cluster Capacity</h2>
+            <p class="muted">Приблизна оцінка: яку модель і context кластер потягне без OOM.</p>
+          </div>
+          <div class="actions compact">
+            <button onclick="estimateCapacity()">Estimate capacity</button>
+            <button class="primary" onclick="autoWeighted()">Auto Optimize Weighted</button>
+          </div>
+        </div>
+        <div id="capacityBox" class="capacity-box"></div>
+        <div id="weightedPlanBox" class="capacity-box"></div>
+      </section>
+
+      <section class="card">
+        <h2>Model Browser</h2>
+        <div class="searchbar">
+          <input id="modelQuery" placeholder="Наприклад: qwen 14b gguf, llama 8b gguf, mistral gguf" value="qwen gguf">
+          <button class="primary" onclick="searchModels()">Search Hugging Face</button>
+        </div>
+        <div class="model-layout">
+          <div>
+            <h3>Результати</h3>
+            <div id="hfResults" class="list"></div>
+          </div>
+          <div>
+            <h3>GGUF файли</h3>
+            <div id="hfFiles" class="list"></div>
+          </div>
+          <div>
+            <h3>Локальні моделі</h3>
+            <div class="cache-actions">
+              <label class="check"><input id="keepSelectedOnClear" type="checkbox" checked> при локальній очистці залишити selected</label>
+              <button onclick="clearLocalModelCache()">Очистити локальний cache</button>
+            </div>
+            <div id="localModels" class="list"></div>
+          </div>
+        </div>
+        <label>Обрана модель <input id="modelPath" placeholder="/models/model.gguf"></label>
+      </section>
+
+      <section class="card focus-card">
+        <div>
+          <h2>Coordinator</h2>
+          <p class="muted">Запускає OpenAI-compatible llama-server з обраною моделлю і знайденими workers.</p>
+        </div>
+        <div class="actions">
+          <button class="primary" onclick="startCoordinator()">Старт coordinator</button>
+          <button onclick="stopCoordinator()">Стоп coordinator</button>
+          <button onclick="openAPI()">Відкрити API UI</button>
+        </div>
+        <p id="coordinatorState" class="state">...</p>
+        <p id="loadState" class="muted">...</p>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <div>
+            <h2>Chat</h2>
+            <p class="muted">Працює через локальний coordinator API. Спочатку вибери модель і натисни “Старт coordinator”.</p>
+          </div>
+          <div class="actions compact">
+            <button class="primary" id="sendBtn" onclick="sendChat()">Send</button>
+            <button id="stopGenBtn" onclick="stopGeneration()" disabled>Stop generation</button>
+            <button onclick="regenerateLast()">Regenerate</button>
+            <button onclick="clearChat()">Clear</button>
+          </div>
+        </div>
+        <div id="chatBox" class="chat-box"></div>
+        <div class="chat-input">
+          <textarea id="chatInput" placeholder="Напиши повідомлення..." onkeydown="chatKey(event)"></textarea>
+          <button class="primary" id="sendBtnBottom" onclick="sendChat()">Send</button>
+        </div>
+      </section>
+    </section>
+
+    <section class="card">
+      <div class="row">
+        <h2>Консоль</h2>
+        <button onclick="copyLogs()">Копіювати консоль</button>
+      </div>
+      <pre id="logs"></pre>
+    </section>
+  </main>
+
+  <div id="settingsModal" class="modal hidden">
+    <div class="modal-card">
+      <div class="row">
+        <h2>Налаштування</h2>
+        <button onclick="closeSettings()">×</button>
+      </div>
+      <div class="grid two">
+        <div>
+          <h3>Шляхи</h3>
+          <label>llama.cpp папка <input id="llamaDir"></label>
+          <label class="coordinator-setting">Папка моделей <input id="modelsDirInput"></label>
+        </div>
+        <div>
+          <h3>Порти / модель</h3>
+          <label>RPC port <input id="rpcPort" type="number" value="50052"></label>
+          <label>Compute mode
+            <select id="computeMode">
+              <option value="auto">Auto</option>
+              <option value="gpu">GPU</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </label>
+          <label class="coordinator-setting">API port <input id="apiPort" type="number" value="8080"></label>
+          <div class="coordinator-setting token-setting">
+            <div class="token-setting-head">
+              <label for="context">Context / tokens</label>
+              <button type="button" class="small" id="contextMaxBtn" onclick="setContextMax()">Max context supported by model</button>
+            </div>
+            <input id="context" type="range" min="0" max="131072" step="256" value="4096" oninput="updateContextValue()">
+            <div class="token-setting-meta"><strong id="contextValue">4096</strong><span id="contextMaxLabel">max: unknown</span></div>
+          </div>
+          <label class="coordinator-setting">GPU layers <input id="gpuLayers" type="number" value="20"></label>
+          <label class="coordinator-setting">Threads <input id="threads" type="number" value="8"></label>
+          <label class="coordinator-setting">Parallel slots <input id="parallel" type="number" value="1"></label>
+          <label class="coordinator-setting">Prompt cache RAM MB <input id="cacheRam" type="number" value="0"></label>
+          <label class="coordinator-setting">Batch <input id="batch" type="number" value="512"></label>
+          <label class="coordinator-setting">Micro-batch <input id="uBatch" type="number" value="512"></label>
+          <label class="coordinator-setting">Tensor split / weights <input id="tensorSplit" placeholder="auto, e.g. 4.0,8.0,2.0"></label>
+        </div>
+      </div>
+      <div class="settings-footer">
+        <button onclick="installDeps()">Install dependencies</button>
+        <button onclick="forceRepairDeps()">Force repair / redownload</button>
+        <button class="coordinator-setting" onclick="optimizeSettings()">Optimize settings</button>
+        <button class="coordinator-setting primary" onclick="autoWeighted()">Auto Optimize Weighted</button>
+        <button class="primary" onclick="saveSettings()">Зберегти</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

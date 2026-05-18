@@ -1,0 +1,5 @@
+.DS_Store
+/clusterkit
+/dist/
+*.log
+*.tmp
