@@ -25,6 +25,13 @@ ClusterKit is a small local-first app for running `llama.cpp` with RPC workers o
 - Streams chat responses in the UI.
 - Exposes an OpenAI-compatible API on the ClusterKit app port.
 
+
+## Interface example
+
+Terminal UI example with coordinator status, cluster capacity, launch settings, actions, and connected workers:
+
+![ClusterKit terminal UI example](docs/images/clusterkit-tui-example.jpg)
+
 ## Performance note
 
 Informal local test, not a benchmark suite:
