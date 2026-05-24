@@ -3,9 +3,10 @@ let selectedRepo = null;
 let startupRoleAsked = false;
 let generating = false;
 let chatAbortController = null;
+let workersDirty = false;
 let contextMax = 131072;
 let contextMaxKnown = false;
-let chatMessages = [{role:'system', content:'You are a helpful local assistant.'}];
+let chatMessages = [{role:'system', content:'You are a helpful local assistant. Answer in the user\'s language. If you use hidden reasoning, keep it brief, finish it, then provide the final answer. Do not continue indefinitely or repeat zeros.'}];
 const $ = id => document.getElementById(id);
 async function api(path, opts={}) { const r = await fetch(path, opts); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 function esc(s){return String(s||'').replaceAll('&','&amp;').replaceAll('"','&quot;').replaceAll('<','&lt;')}
@@ -19,6 +20,22 @@ function updateContextValue(){
   if($('contextValue')) $('contextValue').textContent=String(value);
   if($('contextMaxLabel')) $('contextMaxLabel').textContent=contextMaxKnown?`max: ${contextMax}`:'max: unknown';
   if($('contextMaxBtn')) $('contextMaxBtn').disabled=!contextMaxKnown;
+}
+function updateRPCLayersHint(){
+  const hint=$('rpcLayersHint'); if(!hint) return;
+  const workers=(config?.workers||[]).filter(w=>!w.disabled && (w.ok || String(w.status||'').toLowerCase().includes('connected')));
+  const layers=Number($('gpuLayers')?.value ?? config?.gpuLayers ?? 0);
+  if(workers.length && layers===0){
+    hint.textContent='Workers connected, but GPU/RPC layers = 0, so RPC workers will stay mostly idle. Set >0 to offload model layers.';
+    hint.className='coordinator-setting capacity-warn';
+  } else if(workers.length){
+    const local = $('coordinatorLocal')?.checked ? 'Coordinator also computes locally.' : 'Coordinator local compute is off.';
+    hint.textContent=`${workers.length} worker(s) can receive offloaded layers. ${local}`;
+    hint.className='coordinator-setting muted';
+  } else {
+    hint.textContent='';
+    hint.className='coordinator-setting muted';
+  }
 }
 function setContextControl(value, max=0){
   const el=$('context'); if(!el) return;
@@ -35,6 +52,10 @@ async function setContextMax(){
   el.value=String(contextMax);
   updateContextValue();
   await save().catch(()=>{});
+}
+function updateTokenLimitControls(){
+  const off = !!$('chatNoTokenLimit')?.checked;
+  if($('chatMaxTokens')) $('chatMaxTokens').disabled = off;
 }
 function updateGenerationControls(){
   if($('stopGenBtn')) $('stopGenBtn').disabled = !generating;
@@ -54,12 +75,17 @@ function collect(){
   config.apiPort = Number($('apiPort')?.value || config.apiPort || 8080);
   config.context = Number($('context')?.value || config.context || 4096);
   config.gpuLayers = Number($('gpuLayers')?.value || config.gpuLayers || 20);
+  config.coordinatorLocal = !!$('coordinatorLocal')?.checked;
   config.threads = Number($('threads')?.value || config.threads || 8);
   config.parallel = Number($('parallel')?.value || config.parallel || 1);
   config.cacheRam = Number($('cacheRam')?.value || config.cacheRam || 0);
+  config.chatTimeoutSec = Number($('chatTimeout')?.value || config.chatTimeoutSec || 1800);
+  config.chatNoTokenLimit = !!$('chatNoTokenLimit')?.checked;
+  config.chatMaxTokens = Number($('chatMaxTokens')?.value || config.chatMaxTokens || 1200);
   config.batch = Number($('batch')?.value || config.batch || 512);
   config.uBatch = Number($('uBatch')?.value || config.uBatch || 512);
-  config.tensorSplit = config.weightedMode ? '' : ($('tensorSplit')?.value || config.tensorSplit || '');
+  config.splitMode = $('splitMode')?.value || config.splitMode || 'layer';
+  config.tensorSplit = $('tensorSplit')?.value || config.tensorSplit || '';
   config.workers = config.workers || [];
 }
 function renderRoleUI(){
@@ -101,15 +127,43 @@ function workerUsableGB(w){
   if(ramGB>0) return Math.max(2, ramGB*0.45);
   return 4;
 }
+function workerEditorActive(){
+  return !!document.activeElement?.closest?.('.worker-card');
+}
+function updateWorkerSetting(i, key, value){
+  if(!config) config = {};
+  config.workers = config.workers || [];
+  const w = config.workers[i];
+  if(!w) return;
+  if(key === 'enabled') w.disabled = !value;
+  else if(key === 'splitWeight') w.splitWeight = Math.max(0, Number(value||0));
+  else if(key === 'port') w.port = Math.max(1, Number(value||50052));
+  else if(key === 'name') w.name = String(value||'');
+  workersDirty = true;
+  updateRPCLayersHint();
+}
+async function saveWorkerSettings(){
+  workersDirty = false;
+  await save();
+}
+function copyManualWorkerSettings(next, prev){
+  const byKey = new Map((prev||[]).map(w=>[`${w.host||''}:${w.port||50052}`, w]));
+  const byHost = new Map((prev||[]).map(w=>[w.host||'', w]));
+  return (next||[]).map(w=>{
+    const old = byKey.get(`${w.host||''}:${w.port||50052}`) || byHost.get(w.host||'');
+    if(!old) return w;
+    return {...w, name: old.name || w.name, disabled: !!old.disabled, splitWeight: Number(old.splitWeight||0)};
+  });
+}
 function renderWorkers(workers=[]){
   const box = $('workers'); if(!box) return;
   box.innerHTML='';
   if(!workers.length){ box.innerHTML='<p class="muted">Workers поки не знайдені.</p>'; return; }
-  workers.forEach(w=>{
-    const div=document.createElement('div'); div.className='worker-card';
+  workers.forEach((w,i)=>{
+    const div=document.createElement('div'); div.className='worker-card'+(w.disabled?' disabled':'');
     const st = (w.status || (w.ok?'connected':'offline')).toLowerCase();
-    const statusClass = st.includes('busy') ? 'warn' : (w.ok ? 'ok' : 'bad');
-    const statusText = st.includes('busy') ? 'BUSY / AGENT ALIVE' : (w.ok ? 'CONNECTED' : 'OFFLINE');
+    const statusClass = w.disabled ? 'warn' : (st.includes('busy') ? 'warn' : (w.ok ? 'ok' : 'bad'));
+    const statusText = w.disabled ? 'DISABLED' : (st.includes('busy') ? 'BUSY / AGENT ALIVE' : (w.ok ? 'CONNECTED' : 'OFFLINE'));
     const seen = w.seenMs ? ` · heartbeat ${(w.seenMs/1000).toFixed(1)}s ago` : '';
     const status = `<span class="state ${statusClass}">${statusText}${seen}</span>`;
     const os = `${w.os||'unknown'}/${w.arch||'?'}`;
@@ -118,9 +172,16 @@ function renderWorkers(workers=[]){
     const vram = w.vramBytes ? fmtBytes(w.vramBytes) : '—';
     const backend = w.backend || 'unknown';
     const usable = fmtGB(workerUsableGB(w));
+    const splitWeight = Number(w.splitWeight||0) > 0 ? Number(w.splitWeight).toFixed(1) : '';
     div.innerHTML=`
       <strong>${esc(w.name||w.host)}</strong>
       <small>${esc(w.host)}:${w.port||50052}</small>
+      <div class="worker-manual">
+        <label class="check"><input type="checkbox" ${w.disabled?'':'checked'} onchange="updateWorkerSetting(${i},'enabled',this.checked)"> use in coordinator</label>
+        <label>Name <input value="${esc(w.name||'')}" placeholder="${esc(w.host)}" oninput="updateWorkerSetting(${i},'name',this.value)"></label>
+        <label>RPC port <input type="number" min="1" step="1" value="${w.port||50052}" oninput="updateWorkerSetting(${i},'port',this.value)"></label>
+        <label>Split weight <input type="number" min="0" step="0.1" value="${splitWeight}" placeholder="auto ${workerUsableGB(w).toFixed(1)}" oninput="updateWorkerSetting(${i},'splitWeight',this.value)"></label>
+      </div>
       <div class="worker-specs">
         <span>OS: <b>${esc(os)}</b></span>
         <span>CPU: <b>${esc(cpu)}</b></span>
@@ -141,26 +202,31 @@ function renderWorkers(workers=[]){
 function fill(cfg){
   config=cfg || {};
   $('llamaDir').value=config.llamaDir||''; $('modelsDirInput').value=config.modelsDir||''; $('modelPath').value=config.modelPath||'';
-  $('rpcPort').value=config.rpcPort||50052; if($('computeMode')) $('computeMode').value=config.computeMode||'auto'; $('apiPort').value=config.apiPort||8080; setContextControl(config.context||4096, config.modelMaxContext||0); $('gpuLayers').value=config.gpuLayers||20; $('threads').value=config.threads||8;
-  $('parallel').value=config.parallel||1; $('cacheRam').value=config.cacheRam||0; $('batch').value=config.batch||512; $('uBatch').value=config.uBatch||512; if($('tensorSplit')) $('tensorSplit').value=config.tensorSplit||'';
+  $('rpcPort').value=config.rpcPort||50052; if($('computeMode')) $('computeMode').value=config.computeMode||'auto'; $('apiPort').value=config.apiPort||8080; setContextControl(config.context||4096, config.modelMaxContext||0); $('gpuLayers').value=config.gpuLayers ?? 0; if($('coordinatorLocal')) $('coordinatorLocal').checked=!!config.coordinatorLocal; $('threads').value=config.threads||8;
+  $('parallel').value=config.parallel||1; $('cacheRam').value=config.cacheRam||0; if($('chatTimeout')) $('chatTimeout').value=config.chatTimeoutSec||1800; if($('chatMaxTokens')) $('chatMaxTokens').value=config.chatMaxTokens||1200; if($('chatNoTokenLimit')) $('chatNoTokenLimit').checked=!!config.chatNoTokenLimit; updateTokenLimitControls(); $('batch').value=config.batch||512; $('uBatch').value=config.uBatch||512; if($('splitMode')) $('splitMode').value=config.splitMode||'layer'; if($('tensorSplit')) $('tensorSplit').value=config.tensorSplit||'';
   renderWorkers(config.workers||[]); refreshLocalModels(); renderChat(); renderRoleUI();
+  updateRPCLayersHint();
   if(!startupRoleAsked){ startupRoleAsked = true; showRoleGate(true); }
 }
 async function refresh(){
   const s=await api('/api/status'); if(!config) fill(s.config);
   window.lastStatus = s;
   $('localIP').textContent=s.localIP||'unknown'; $('os').textContent=`${s.os}/${s.arch}`;
-  if($('computeMode')){ $('computeMode').disabled = s.os === 'darwin'; if(s.os === 'darwin') $('computeMode').value='gpu'; }
+  if($('computeMode')) $('computeMode').disabled = false;
   $('modelsDir').textContent=s.modelsDir||''; const inst=s.installStatus||{}; $('llamaReady').textContent=s.llamaReady?`Ready (${inst.mode||'default'})`:`Not installed (${inst.reason||'missing'})`; $('llamaReady').className=s.llamaReady?'state ok':'state bad';
   if(s.hardware){ $('hardwareInfo').textContent=`${s.hardware.hostname} · ${s.hardware.cpuCount} CPU · ${fmtBytes(s.hardware.ramBytes)} RAM${s.hardware.vramBytes?' · '+fmtBytes(s.hardware.vramBytes)+' VRAM':''}${s.hardware.backend?' · '+s.hardware.backend:''}`; }
   if($('workerState')){ $('workerState').textContent=s.workerRunning?'Running':'Stopped'; $('workerState').className='state '+(s.workerRunning?'ok':'bad'); }
   if($('coordinatorState')){ $('coordinatorState').textContent=s.coordinatorRunning?'Running':'Stopped'; $('coordinatorState').className='state '+(s.coordinatorRunning?'ok':'bad'); }
   if($('loadState')){ const load=s.serverLoad||'idle'; const sec=s.loadStartedMs?Math.round(s.loadStartedMs/1000):0; $('loadState').textContent=s.coordinatorRunning?`Model: ${load}${load!=='ready'&&sec?` · ${sec}s`:''}`:'Model: idle'; }
+  renderDownloadProgress(s.download);
   $('logs').textContent=(s.logs||[]).join('\n');
-  if(config && config.role === 'coordinator'){
-    config.workers = s.workerStatuses || s.config?.workers || [];
-    renderWorkers(config.workers);
+  if(config && config.roleExplicit && config.role === 'coordinator'){
+    if(!workersDirty && !workerEditorActive()){
+      config.workers = copyManualWorkerSettings(s.workerStatuses || s.config?.workers || [], config.workers || []);
+      renderWorkers(config.workers);
+    }
     renderCapacity(estimateCapacityFromStatus(s));
+    updateRPCLayersHint();
   }
   renderRoleUI();
 }
@@ -174,10 +240,10 @@ async function startWorker(){ await save(); await api('/api/start-worker',{metho
 async function stopWorker(){ await api('/api/stop-worker',{method:'POST'}); await refresh(); }
 async function startCoordinator(){ await save(); await api('/api/start-coordinator',{method:'POST'}).catch(e=>alert(e.message)); await refresh(); }
 async function stopCoordinator(){ await api('/api/stop-coordinator',{method:'POST'}); await refresh(); }
-async function checkWorkers(){ const workers=await api('/api/check-workers',{method:'POST'}); config.workers=workers; renderWorkers(workers); }
+async function checkWorkers(){ const workers=await api('/api/check-workers',{method:'POST'}); config.workers=copyManualWorkerSettings(workers, config.workers || []); renderWorkers(config.workers); }
 async function discoverWorkers(){
   const peers=await api('/api/discover',{method:'POST'}).catch(e=>{alert(e.message); return []});
-  config.workers = peers.map(p=>({name:p.name||p.host,host:p.host,port:p.port||50052,appPort:p.appPort||8765,os:p.os,arch:p.arch,ramBytes:p.ramBytes||p.RAM||0,vramBytes:p.vramBytes||0,backend:p.backend||'',threads:p.threads||0,crashCount:p.crashCount||0,stability:p.stability||1,rssBytes:p.rssBytes||0,loadPct:p.loadPct||0,status:'discovered'}));
+  config.workers = copyManualWorkerSettings(peers.map(p=>({name:p.name||p.host,host:p.host,port:p.port||50052,appPort:p.appPort||8765,os:p.os,arch:p.arch,ramBytes:p.ramBytes||p.RAM||0,vramBytes:p.vramBytes||0,backend:p.backend||'',threads:p.threads||0,crashCount:p.crashCount||0,stability:p.stability||1,rssBytes:p.rssBytes||0,loadPct:p.loadPct||0,status:'discovered'})), config.workers || []);
   renderWorkers(config.workers); await save(); await checkWorkers(); alert(`Found ${peers.length} worker(s)`);
 }
 function estimateCapacity(){ renderCapacity(estimateCapacityFromStatus(window.lastStatus || null)); }
@@ -185,7 +251,7 @@ function estimateCapacityFromStatus(s){
   if(!s) return null;
   const macRamGB=(s.hardware?.ramBytes||0)/1024/1024/1024;
   const macUsable=Math.max(0, Math.min(macRamGB*0.72, macRamGB-3));
-  const workers=(s.workerStatuses||s.config?.workers||[]).filter(w=>w.ok);
+  const workers=(s.workerStatuses||s.config?.workers||[]).filter(w=>w.ok && !w.disabled);
   const workerUsable=workers.reduce((sum,w)=>sum+workerUsableGB(w),0);
   const total=macUsable+workerUsable;
   const ctx = total>=48?16384:total>=28?8192:4096;
@@ -215,27 +281,6 @@ function renderCapacity(c){
   `;
 }
 async function optimizeSettings(){ const rec=await api('/api/optimize',{method:'POST'}); setContextControl(rec.context, contextMaxKnown?contextMax:0); $('gpuLayers').value=rec.gpuLayers; $('threads').value=rec.threads; alert('Optimized: '+rec.reason); await refresh(); }
-async function autoWeighted(){
-  await save().catch(()=>{});
-  const plan=await api('/api/auto-weighted',{method:'POST'}).catch(e=>{alert(e.message); return null});
-  if(!plan) return;
-  setContextControl(plan.context, contextMaxKnown?contextMax:0);
-  $('gpuLayers').value=plan.gpuLayers;
-  $('threads').value=plan.threads;
-  $('parallel').value=plan.parallel;
-  $('batch').value=plan.batch;
-  $('uBatch').value=plan.uBatch;
-  config.weightedMode = true;
-  config.tensorSplit = '';
-  if($('tensorSplit')) $('tensorSplit').value='';
-  renderWeightedPlan(plan);
-  await refresh();
-}
-function renderWeightedPlan(plan){
-  const box=$('weightedPlanBox'); if(!box || !plan) return;
-  const rows=(plan.workers||[]).map(w=>`<div class="worker-card"><strong>${esc(w.name||w.host)}</strong><small>${esc(w.host)} · ${esc(w.backend||'unknown')}</small><small>usable ${fmtGB(w.usableGB)} · weight ${Number(w.weight||0).toFixed(2)} · share ${Number(w.sharePct||0).toFixed(1)}%</small></div>`).join('');
-  box.innerHTML=`<div class="capacity-section"><strong>Weighted plan:</strong> ctx ${plan.context}, batch ${plan.batch}, ubatch ${plan.uBatch}, parallel ${plan.parallel}<br><small>recommended split: ${esc(plan.tensorSplit||'auto')} · active mode: fit-first, no forced tensor-split</small><br><small>${esc(plan.reason||'')}</small></div><div class="worker-list">${rows}</div>`;
-}
 async function openAPI(){ await api('/api/open',{method:'POST'}); }
 async function copyLogs(){
   const text=$('logs').textContent || '';
@@ -254,7 +299,23 @@ async function loadFiles(repo){
   $('hfFiles').innerHTML='';
   files.forEach(f=>{ const div=document.createElement('div'); div.className='item file-item'; const size=fmtFileSize(f.size); div.innerHTML=`<div class="file-title"><strong>${esc(f.rfilename)}</strong><span class="size-badge">${esc(size)}</span></div><small>GGUF model file · ${esc(size)}</small><button class="primary" onclick="downloadModel('${esc(repo)}','${esc(f.rfilename)}')">Download ${esc(size)}</button>`; $('hfFiles').appendChild(div); });
 }
-async function downloadModel(repo,file){ await api('/api/models/download',{method:'POST',body:JSON.stringify({repo,file})}); alert('Download started. Прогрес у консолі.'); }
+async function downloadModel(repo,file){ await api('/api/models/download',{method:'POST',body:JSON.stringify({repo,file})}).catch(e=>{alert(e.message); throw e}); await refresh(); }
+function renderDownloadProgress(d){
+  const box=$('downloadProgress'); if(!box) return;
+  if(!d || (!d.active && !d.status)){ box.classList.add('hidden'); box.innerHTML=''; return; }
+  const hasTotal=Number(d.total)>0;
+  const pct=hasTotal?Math.max(0,Math.min(100,Number(d.percent||0))):0;
+  const downloaded=fmtBytes(Number(d.downloaded||0));
+  const total=hasTotal?fmtBytes(Number(d.total)):'?';
+  const speed=d.speedBps?` · ${fmtBytes(Number(d.speedBps))}/s`:'';
+  const label=d.active
+    ? `Downloading ${esc(d.file||'model')} — ${hasTotal?pct+'% · ':''}${downloaded} / ${total}${speed}`
+    : d.status==='complete'
+      ? `Download complete: ${esc(d.file||'model')} · ${downloaded}`
+      : `Download ${esc(d.status||'status')}: ${esc(d.error||d.file||'')}`;
+  box.classList.remove('hidden');
+  box.innerHTML=`<div class="download-head"><strong>${label}</strong><small>${esc(d.repo||'')}</small></div><div class="progress"><span style="width:${pct}%"></span></div>`;
+}
 async function clearLocalModelCache(){
   if(!confirm('Очистити локальний cache моделей на цьому девайсі?')) return;
   const keepSelected=$('keepSelectedOnClear')?.checked ?? true;
@@ -272,7 +333,13 @@ async function selectModel(path){ await api('/api/models/select',{method:'POST',
 async function deleteModel(path){ if(!confirm('Delete model?')) return; await api('/api/models/delete',{method:'POST',body:JSON.stringify({path})}); await refreshLocalModels(); await refresh(); }
 function renderChat(){
   const box=$('chatBox'); if(!box) return; box.innerHTML='';
-  chatMessages.filter(m=>m.role!=='system').forEach(m=>{ const div=document.createElement('div'); div.className='msg '+m.role; const meta=m.meta?`<small>${esc(m.meta)}</small>`:''; div.innerHTML=`<strong>${m.role==='user'?'You':'Assistant'}</strong><div>${esc(m.content).replaceAll('\n','<br>')}</div>${meta}`; box.appendChild(div); });
+  chatMessages.filter(m=>m.role!=='system').forEach(m=>{
+    const div=document.createElement('div'); div.className='msg '+m.role;
+    const meta=m.meta?`<small>${esc(m.meta)}</small>`:'';
+    const thought=m.thought?`<details class="thinking" open><summary>Thinking</summary><div>${esc(m.thought).replaceAll('\n','<br>')}</div></details>`:'';
+    div.innerHTML=`<strong>${m.role==='user'?'You':'Assistant'}</strong>${thought}<div>${esc(m.content).replaceAll('\n','<br>')}</div>${meta}`;
+    box.appendChild(div);
+  });
   box.scrollTop=box.scrollHeight;
 }
 function clearChat(){ chatMessages=[{role:'system', content:'You are a helpful local assistant.'}]; renderChat(); }
@@ -296,7 +363,7 @@ async function generateAssistant(){
   generating = true;
   chatAbortController = new AbortController();
   updateGenerationControls();
-  const thinking={role:'assistant', content:'', meta:'generating…'}; chatMessages.push(thinking); renderChat();
+  const thinking={role:'assistant', content:'', thought:'', meta:'generating…', inThink:false, thinkBuf:''}; chatMessages.push(thinking); renderChat();
   const started=performance.now();
   try{
     const res=await fetch('/api/chat-stream',{method:'POST',headers:{'Content-Type':'application/json'},signal:chatAbortController.signal,body:JSON.stringify({messages:chatMessages.filter(m=>m.content!=='' || m.role!=='assistant').map(({role,content})=>({role,content})),temperature:0.7})});
@@ -311,7 +378,11 @@ async function generateAssistant(){
         const lines=ev.split('\n'); const type=(lines.find(l=>l.startsWith('event:'))||'event: message').slice(6).trim(); const dataLine=lines.find(l=>l.startsWith('data:')); if(!dataLine) continue;
         const data=JSON.parse(dataLine.slice(5).trim());
         if(type==='token'){
-          thinking.content += data.content || '';
+          appendAssistantChunk(thinking, data.content || '', false);
+          thinking.meta = `${((performance.now()-started)/1000).toFixed(1)}s · ${data.tokens||0} chunks`;
+          renderChat();
+        }else if(type==='thought'){
+          appendAssistantChunk(thinking, data.content || '', true);
           thinking.meta = `${((performance.now()-started)/1000).toFixed(1)}s · ${data.tokens||0} chunks`;
           renderChat();
         }else if(type==='status'){
@@ -339,5 +410,20 @@ async function generateAssistant(){
   chatAbortController = null;
   updateGenerationControls();
   renderChat();
+}
+function appendAssistantChunk(msg, chunk, forceThought=false){
+  if(!chunk) return;
+  if(forceThought){ msg.thought = (msg.thought||'') + chunk; return; }
+  let s = chunk;
+  while(s){
+    if(msg.inThink){
+      const end=s.indexOf('</think>');
+      if(end === -1){ msg.thought += s; return; }
+      msg.thought += s.slice(0,end); s=s.slice(end+8); msg.inThink=false; continue;
+    }
+    const start=s.indexOf('<think>');
+    if(start === -1){ msg.content += s; return; }
+    msg.content += s.slice(0,start); s=s.slice(start+7); msg.inThink=true;
+  }
 }
 refresh(); setInterval(refresh, 2000); setInterval(refreshLocalModels, 8000);

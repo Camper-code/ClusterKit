@@ -1,5 +1,34 @@
+# OS/editor noise
 .DS_Store
-/clusterkit
-/dist/
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Logs/temp
 *.log
 *.tmp
+*.pid
+
+# Build outputs
+/clusterkit
+/clusterkit.exe
+*.test
+*.prof
+/dist/
+/build/
+
+# Local runtime state / downloaded assets
+/config.json
+/models/
+*.gguf
+*.safetensors
+*.bin
+*.m
+*.t
+
+# Secrets/local env
+.env
+.env.*
+!.env.example

@@ -59,11 +59,12 @@
         <div class="row">
           <div>
             <h2>Workers</h2>
-            <p class="muted">Ручного додавання більше нема. Тільки auto-discover.</p>
+            <p class="muted">Auto-discover знаходить workers; далі можна вручну вимкнути worker або задати його split weight.</p>
           </div>
           <div class="actions compact">
             <button class="primary" onclick="discoverWorkers()">Знайти workers</button>
             <button onclick="checkWorkers()">Перевірити</button>
+            <button onclick="saveWorkerSettings()">Зберегти worker settings</button>
           </div>
         </div>
         <div id="workers" class="worker-list"></div>
@@ -73,15 +74,13 @@
         <div class="row">
           <div>
             <h2>Cluster Capacity</h2>
-            <p class="muted">Приблизна оцінка: яку модель і context кластер потягне без OOM.</p>
+            <p class="muted">Приблизна оцінка: яку модель і context кластер потягне без OOM. Без auto-weight/auto-offload.</p>
           </div>
           <div class="actions compact">
             <button onclick="estimateCapacity()">Estimate capacity</button>
-            <button class="primary" onclick="autoWeighted()">Auto Optimize Weighted</button>
           </div>
         </div>
         <div id="capacityBox" class="capacity-box"></div>
-        <div id="weightedPlanBox" class="capacity-box"></div>
       </section>
 
       <section class="card">
@@ -90,6 +89,7 @@
           <input id="modelQuery" placeholder="Наприклад: qwen 14b gguf, llama 8b gguf, mistral gguf" value="qwen gguf">
           <button class="primary" onclick="searchModels()">Search Hugging Face</button>
         </div>
+        <div id="downloadProgress" class="download-progress hidden"></div>
         <div class="model-layout">
           <div>
             <h3>Результати</h3>
@@ -186,12 +186,27 @@
             <input id="context" type="range" min="0" max="131072" step="256" value="4096" oninput="updateContextValue()">
             <div class="token-setting-meta"><strong id="contextValue">4096</strong><span id="contextMaxLabel">max: unknown</span></div>
           </div>
-          <label class="coordinator-setting">GPU layers <input id="gpuLayers" type="number" value="20"></label>
+          <label class="coordinator-setting">GPU/RPC layers <input id="gpuLayers" type="number" min="0" step="1" value="20" oninput="updateRPCLayersHint()"></label>
+          <p class="coordinator-setting muted" id="rpcLayersHint"></p>
+          <label class="coordinator-setting check"><input id="coordinatorLocal" type="checkbox" onchange="updateRPCLayersHint()"> Coordinator теж рахує локально</label>
+          <p class="coordinator-setting muted">Вимкнено = coordinator тільки API/керування, шари йдуть на RPC workers.</p>
           <label class="coordinator-setting">Threads <input id="threads" type="number" value="8"></label>
           <label class="coordinator-setting">Parallel slots <input id="parallel" type="number" value="1"></label>
           <label class="coordinator-setting">Prompt cache RAM MB <input id="cacheRam" type="number" value="0"></label>
+          <label class="coordinator-setting">Chat timeout sec <input id="chatTimeout" type="number" min="30" step="30" value="1800"></label>
+          <label class="coordinator-setting">Max output tokens <input id="chatMaxTokens" type="number" min="1" step="1" value="1200"></label>
+          <label class="coordinator-setting check"><input id="chatNoTokenLimit" type="checkbox" onchange="updateTokenLimitControls()"> Без ліміту відповіді</label>
+          <p class="coordinator-setting muted">Вимкнений ліміт не ріже відповідь по max_tokens, але модель все одно обмежена context/timeouts.</p>
           <label class="coordinator-setting">Batch <input id="batch" type="number" value="512"></label>
           <label class="coordinator-setting">Micro-batch <input id="uBatch" type="number" value="512"></label>
+          <label class="coordinator-setting">Split mode
+            <select id="splitMode">
+              <option value="layer">Layer — stable, whole layers per device</option>
+              <option value="row">Row — split rows across devices</option>
+              <option value="tensor">Tensor — experimental tensor split</option>
+              <option value="none">None — one device only</option>
+            </select>
+          </label>
           <label class="coordinator-setting">Tensor split / weights <input id="tensorSplit" placeholder="auto, e.g. 4.0,8.0,2.0"></label>
         </div>
       </div>
@@ -199,7 +214,6 @@
         <button onclick="installDeps()">Install dependencies</button>
         <button onclick="forceRepairDeps()">Force repair / redownload</button>
         <button class="coordinator-setting" onclick="optimizeSettings()">Optimize settings</button>
-        <button class="coordinator-setting primary" onclick="autoWeighted()">Auto Optimize Weighted</button>
         <button class="primary" onclick="saveSettings()">Зберегти</button>
       </div>
     </div>

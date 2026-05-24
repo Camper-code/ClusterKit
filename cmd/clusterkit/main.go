@@ -37,46 +37,56 @@ import (
 var uiFS embed.FS
 
 type Config struct {
-	Role         string   `json:"role"`
-	RoleExplicit bool     `json:"roleExplicit"`
-	ModelPath    string   `json:"modelPath"`
-	ModelsDir    string   `json:"modelsDir"`
-	APIPort      int      `json:"apiPort"`
-	RPCPort      int      `json:"rpcPort"`
-	Workers      []Worker `json:"workers"`
-	LlamaDir     string   `json:"llamaDir"`
-	Context      int      `json:"context"`
-	GPULayers    int      `json:"gpuLayers"`
-	Threads      int      `json:"threads"`
-	Parallel     int      `json:"parallel"`
-	CacheRAM     int      `json:"cacheRam"`
-	Batch        int      `json:"batch"`
-	UBatch       int      `json:"uBatch"`
-	TensorSplit  string   `json:"tensorSplit"`
-	ComputeMode  string   `json:"computeMode"`
-	MemoryMode   string   `json:"memoryMode"`
-	WorkerPolicy string   `json:"workerPolicy"`
-	WeightedMode bool     `json:"weightedMode"`
+	Role              string   `json:"role"`
+	RoleExplicit      bool     `json:"roleExplicit"`
+	ModelPath         string   `json:"modelPath"`
+	ModelsDir         string   `json:"modelsDir"`
+	APIPort           int      `json:"apiPort"`
+	RPCPort           int      `json:"rpcPort"`
+	Workers           []Worker `json:"workers"`
+	LlamaDir          string   `json:"llamaDir"`
+	Context           int      `json:"context"`
+	GPULayers         int      `json:"gpuLayers"`
+	Threads           int      `json:"threads"`
+	Parallel          int      `json:"parallel"`
+	CacheRAM          int      `json:"cacheRam"`
+	ChatTimeout       int      `json:"chatTimeoutSec"`
+	ChatMaxTokens     int      `json:"chatMaxTokens"`
+	ChatNoTokenLimit  bool     `json:"chatNoTokenLimit"`
+	HideThinking      bool     `json:"hideThinking,omitempty"`
+	Batch             int      `json:"batch"`
+	UBatch            int      `json:"uBatch"`
+	TensorSplit       string   `json:"tensorSplit"`
+	SplitMode         string   `json:"splitMode"`
+	ComputeMode       string   `json:"computeMode"`
+	MemoryMode        string   `json:"memoryMode"`
+	CoordinatorLocal  bool     `json:"coordinatorLocal"`
+	CoordinatorLayers int      `json:"coordinatorLayers,omitempty"`
+	WorkerPolicy      string   `json:"workerPolicy"`
+	WeightedMode      bool     `json:"weightedMode"`
 }
 
 type Worker struct {
-	Name       string  `json:"name"`
-	Host       string  `json:"host"`
-	Port       int     `json:"port"`
-	AppPort    int     `json:"appPort,omitempty"`
-	OK         bool    `json:"ok,omitempty"`
-	Status     string  `json:"status,omitempty"`
-	SeenMs     int64   `json:"seenMs,omitempty"`
-	OS         string  `json:"os,omitempty"`
-	Arch       string  `json:"arch,omitempty"`
-	RAMBytes   uint64  `json:"ramBytes,omitempty"`
-	VRAMBytes  uint64  `json:"vramBytes,omitempty"`
-	Backend    string  `json:"backend,omitempty"`
-	Threads    int     `json:"threads,omitempty"`
-	CrashCount int     `json:"crashCount,omitempty"`
-	Stability  float64 `json:"stability,omitempty"`
-	RSSBytes   uint64  `json:"rssBytes,omitempty"`
-	LoadPct    float64 `json:"loadPct,omitempty"`
+	Name        string  `json:"name"`
+	Host        string  `json:"host"`
+	Port        int     `json:"port"`
+	Disabled    bool    `json:"disabled,omitempty"`
+	Layers      int     `json:"layers,omitempty"`
+	SplitWeight float64 `json:"splitWeight,omitempty"`
+	AppPort     int     `json:"appPort,omitempty"`
+	OK          bool    `json:"ok,omitempty"`
+	Status      string  `json:"status,omitempty"`
+	SeenMs      int64   `json:"seenMs,omitempty"`
+	OS          string  `json:"os,omitempty"`
+	Arch        string  `json:"arch,omitempty"`
+	RAMBytes    uint64  `json:"ramBytes,omitempty"`
+	VRAMBytes   uint64  `json:"vramBytes,omitempty"`
+	Backend     string  `json:"backend,omitempty"`
+	Threads     int     `json:"threads,omitempty"`
+	CrashCount  int     `json:"crashCount,omitempty"`
+	Stability   float64 `json:"stability,omitempty"`
+	RSSBytes    uint64  `json:"rssBytes,omitempty"`
+	LoadPct     float64 `json:"loadPct,omitempty"`
 }
 
 type HardwareInfo struct {
@@ -131,6 +141,8 @@ type AppState struct {
 	serverLoad          string
 	serverContext       int
 	serverRPC           string
+	workerStatusCache   []Worker
+	workerStatusAt      time.Time
 	loadStarted         time.Time
 	loadReady           time.Time
 	workerCrashCount    int
@@ -142,6 +154,22 @@ type AppState struct {
 	workerStarted       time.Time
 	lastSelfHeal        time.Time
 	lastCoordinatorHeal time.Time
+	download            DownloadStatus
+}
+
+type DownloadStatus struct {
+	Active     bool   `json:"active"`
+	Repo       string `json:"repo,omitempty"`
+	File       string `json:"file,omitempty"`
+	Path       string `json:"path,omitempty"`
+	Downloaded int64  `json:"downloaded"`
+	Total      int64  `json:"total,omitempty"`
+	Percent    int    `json:"percent,omitempty"`
+	SpeedBps   int64  `json:"speedBps,omitempty"`
+	Status     string `json:"status"`
+	Error      string `json:"error,omitempty"`
+	StartedMs  int64  `json:"startedMs,omitempty"`
+	UpdatedMs  int64  `json:"updatedMs,omitempty"`
 }
 
 func main() {
@@ -152,7 +180,9 @@ func main() {
 	state := &AppState{config: defaultConfig(), discovered: map[string]rememberedPeer{}}
 	_ = os.MkdirAll(appDir(), 0755)
 	if cfg, err := loadConfig(); err == nil {
+		cfg = resetStartupRole(cfg)
 		state.config = cfg
+		_ = saveConfig(cfg)
 	}
 	if *webMode {
 		go func() {
@@ -173,7 +203,6 @@ func main() {
 	mux.HandleFunc("/api/check-workers", state.handleCheckWorkers)
 	mux.HandleFunc("/api/discover", state.handleDiscover)
 	mux.HandleFunc("/api/optimize", state.handleOptimize)
-	mux.HandleFunc("/api/auto-weighted", state.handleAutoWeighted)
 	mux.HandleFunc("/api/open", state.handleOpen)
 	mux.HandleFunc("/api/install", state.handleInstall)
 	mux.HandleFunc("/api/models/search", state.handleModelSearch)
@@ -185,6 +214,21 @@ func main() {
 	mux.HandleFunc("/api/models/cache-clear", state.handleModelCacheClear)
 	mux.HandleFunc("/api/chat", state.handleChat)
 	mux.HandleFunc("/api/chat-stream", state.handleChatStream)
+	// OpenAI-compatible API served by ClusterKit itself. This keeps clients on
+	// the stable ClusterKit app port while proxying generation to the active
+	// llama.cpp coordinator API port.
+	mux.HandleFunc("/health", state.handleOpenAIHealth)
+	mux.HandleFunc("/v1", state.handleOpenAIRoot)
+	mux.HandleFunc("/v1/health", state.handleOpenAIHealth)
+	mux.HandleFunc("/v1/models", state.handleOpenAIModels)
+	mux.HandleFunc("/v1/chat/completions", state.handleOpenAIChatCompletions)
+	mux.HandleFunc("/v1/completions", state.handleOpenAICompletions)
+	// Compatibility aliases for clients that expect base_url to be the server
+	// root instead of /v1. This avoids confusing 404s when a client appends its
+	// own /v1 inconsistently or is configured with http://host:port.
+	mux.HandleFunc("/models", state.handleOpenAIModels)
+	mux.HandleFunc("/chat/completions", state.handleOpenAIChatCompletions)
+	mux.HandleFunc("/completions", state.handleOpenAICompletions)
 
 	listener, addr, err := localListener(8765)
 	if err != nil {
@@ -260,6 +304,15 @@ type tuiChatMsg struct {
 	Err    error
 }
 
+type tuiChatStreamMsg struct {
+	Content string
+	Thought string
+	Tokens  int
+	Ms      int64
+	Done    bool
+	Err     error
+}
+
 type chatLine struct {
 	Role   string
 	Text   string
@@ -298,9 +351,11 @@ type tuiModel struct {
 	hfSearchIn       textinput.Model
 	hfSearchFocus    bool
 	settingSel       int
+	workerLayerSel   int
 	chatIn           textarea.Model
 	chat             []chatLine
 	chatUsed         int
+	chatStream       <-chan tuiChatStreamMsg
 }
 
 type tuiStyles struct {
@@ -317,9 +372,22 @@ type tuiStyles struct {
 
 func newTUIStyles() tuiStyles {
 	accent := lipgloss.Color("208")
+	border := lipgloss.RoundedBorder()
+	if asciiTUI() {
+		border = lipgloss.Border{
+			Top:         "-",
+			Bottom:      "-",
+			Left:        "|",
+			Right:       "|",
+			TopLeft:     "+",
+			TopRight:    "+",
+			BottomLeft:  "+",
+			BottomRight: "+",
+		}
+	}
 	return tuiStyles{
 		base:     lipgloss.NewStyle().Foreground(lipgloss.Color("223")),
-		box:      lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(0, 1),
+		box:      lipgloss.NewStyle().Border(border).BorderForeground(accent).Padding(0, 1),
 		title:    lipgloss.NewStyle().Foreground(accent).Bold(true),
 		muted:    lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
 		selected: lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(accent).Bold(true).Padding(0, 1),
@@ -363,7 +431,8 @@ func runTerminalUI(s *AppState, addr string) {
 			}
 		}},
 		{Key: "d", Label: "Discover workers", Run: func() { tuiDiscover(s) }},
-		{Key: "a", Label: "Auto Optimize", Run: func() { tuiAutoWeighted(s) }},
+		{Key: "a", Label: "API endpoints", Run: func() {}},
+		{Key: "l", Label: "Worker layers", Run: func() {}},
 		{Key: "m", Label: "Select local model", Run: func() {}},
 		{Key: "b", Label: "Browse / download models", Run: func() {}},
 		{Key: "s", Label: "Launch settings", Run: func() {}},
@@ -371,12 +440,12 @@ func runTerminalUI(s *AppState, addr string) {
 		{Key: "q", Label: "Quit", Run: func() {}},
 	}
 	input := textarea.New()
-	input.Placeholder = "Ask local model…"
+	input.Placeholder = terminalText("Ask local model…")
 	input.CharLimit = 4000
 	input.SetWidth(90)
 	input.SetHeight(2)
 	search := textinput.New()
-	search.Placeholder = "Search Hugging Face models…"
+	search.Placeholder = terminalText("Search Hugging Face models…")
 	search.CharLimit = 200
 	search.Width = 80
 	search.SetValue("qwen gguf")
@@ -392,11 +461,11 @@ func runTerminalUI(s *AppState, addr string) {
 func (m tuiModel) Init() tea.Cmd { return tea.Batch(tuiTickCmd(), m.snapshotCmd()) }
 
 func tuiTickCmd() tea.Cmd {
-	return tea.Tick(600*time.Millisecond, func(t time.Time) tea.Msg { return tuiTick(t) })
+	return tea.Tick(1500*time.Millisecond, func(t time.Time) tea.Msg { return tuiTick(t) })
 }
 
 func (m tuiModel) snapshotCmd() tea.Cmd {
-	return func() tea.Msg { return tuiSnapshotMsg(m.state.snapshot()) }
+	return func() tea.Msg { return tuiSnapshotMsg(m.state.fastSnapshot()) }
 }
 
 func (m tuiModel) hfSearchCmd(query string) tea.Cmd {
@@ -419,6 +488,24 @@ func (m tuiModel) chatCmd(messages []map[string]string) tea.Cmd {
 		start := time.Now()
 		reply, tokens, err := m.state.chatOnce(messages)
 		return tuiChatMsg{Reply: reply, Tokens: tokens, Ms: time.Since(start).Milliseconds(), Err: err}
+	}
+}
+
+func (m tuiModel) chatStreamCmd(messages []map[string]string, ch chan<- tuiChatStreamMsg) tea.Cmd {
+	messages = append([]map[string]string(nil), messages...)
+	return func() tea.Msg {
+		m.state.chatStream(messages, ch)
+		return nil
+	}
+}
+
+func listenChatStreamCmd(ch <-chan tuiChatStreamMsg) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-ch
+		if !ok {
+			return tuiChatStreamMsg{Done: true}
+		}
+		return msg
 	}
 }
 
@@ -505,6 +592,37 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.chat = append(m.chat, chatLine{Role: "assistant", Text: msg.Reply, Tokens: msg.Tokens, Ms: msg.Ms, At: time.Now()})
 		}
 		return m, nil
+	case tuiChatStreamMsg:
+		if msg.Err != nil {
+			m.busy = false
+			m.busyText = ""
+			m.chatStream = nil
+			m.chat = append(m.chat, chatLine{Role: "error", Text: msg.Err.Error(), Ms: msg.Ms, At: time.Now()})
+			return m, nil
+		}
+		if msg.Thought != "" && m.showThinking() {
+			m.appendThoughtDelta(msg.Thought, msg.Tokens, msg.Ms)
+		}
+		if msg.Content != "" {
+			m.appendAssistantDelta(msg.Content, msg.Tokens, msg.Ms)
+			if msg.Tokens > 0 {
+				m.chatUsed = msg.Tokens
+			}
+		}
+		if msg.Done {
+			m.busy = false
+			m.busyText = ""
+			m.chatStream = nil
+			m.finishAssistantStream(msg.Tokens, msg.Ms)
+			if msg.Tokens > 0 {
+				m.chatUsed = msg.Tokens
+			}
+			return m, nil
+		}
+		if m.chatStream != nil {
+			return m, listenChatStreamCmd(m.chatStream)
+		}
+		return m, nil
 	case tea.KeyMsg:
 		if m.busy {
 			switch msg.String() {
@@ -556,6 +674,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.screen == "settings" {
 			return m.updateSettingsScreen(msg)
+		}
+		if m.screen == "api" {
+			return m.updateAPIScreen(msg)
+		}
+		if m.screen == "workerLayers" {
+			return m.updateWorkerLayersScreen(msg)
 		}
 		if m.screen == "chat" {
 			return m.updateChatScreen(msg)
@@ -664,10 +788,10 @@ func (m tuiModel) currentRole() string {
 func (m tuiModel) actionAllowed(key string) bool {
 	role := strings.ToLower(m.currentRole())
 	if role == "worker" {
-		return key == "i" || key == "w" || key == "q"
+		return key == "i" || key == "w" || key == "a" || key == "q"
 	}
 	if m.coordinatorRunning() {
-		return key == "c" || key == "t" || key == "q"
+		return key == "c" || key == "a" || key == "t" || key == "q"
 	}
 	return key != "w"
 }
@@ -725,10 +849,6 @@ func (m tuiModel) runSelectedAction() (tea.Model, tea.Cmd) {
 		m.busy = true
 		m.busyText = "Discovering workers on LAN…"
 		return m, m.busyCmd("discover", a.Run)
-	case "a":
-		m.busy = true
-		m.busyText = "Auto-optimizing cluster weights…"
-		return m, m.busyCmd("auto optimize", a.Run)
 	case "m":
 		m.screen = "models"
 		m.browser = "local"
@@ -742,6 +862,12 @@ func (m tuiModel) runSelectedAction() (tea.Model, tea.Cmd) {
 		return m, m.hfSearchCmd(m.hfQuery)
 	case "s":
 		m.screen = "settings"
+		return m, nil
+	case "a":
+		m.screen = "api"
+		return m, nil
+	case "l":
+		m.screen = "workerLayers"
 		return m, nil
 	case "t":
 		m.screen = "chat"
@@ -781,12 +907,74 @@ func (m tuiModel) updateChatScreen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		messages := chatMessagesForModel(m.chat)
 		m.chatIn.SetValue("")
 		m.busy = true
-		m.busyText = "Generating reply…"
-		return m, m.chatCmd(messages)
+		m.busyText = "Generating reply… live stream active"
+		m.chat = append(m.chat, chatLine{Role: "assistant", Text: "", At: time.Now()})
+		ch := make(chan tuiChatStreamMsg, 128)
+		m.chatStream = ch
+		return m, tea.Batch(m.chatStreamCmd(messages, ch), listenChatStreamCmd(ch))
 	}
 	var cmd tea.Cmd
 	m.chatIn, cmd = m.chatIn.Update(msg)
 	return m, cmd
+}
+
+func (m tuiModel) showThinking() bool {
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+	return !m.state.config.HideThinking
+}
+
+func (m *tuiModel) appendAssistantDelta(delta string, tokens int, ms int64) {
+	for i := len(m.chat) - 1; i >= 0; i-- {
+		if m.chat[i].Role == "assistant" {
+			m.chat[i].Text += delta
+			m.chat[i].Tokens = tokens
+			m.chat[i].Ms = ms
+			if m.chat[i].At.IsZero() {
+				m.chat[i].At = time.Now()
+			}
+			return
+		}
+	}
+	m.chat = append(m.chat, chatLine{Role: "assistant", Text: delta, Tokens: tokens, Ms: ms, At: time.Now()})
+}
+
+func (m *tuiModel) appendThoughtDelta(delta string, tokens int, ms int64) {
+	if strings.TrimSpace(delta) == "" {
+		return
+	}
+	for i := len(m.chat) - 1; i >= 0; i-- {
+		if m.chat[i].Role == "assistant" {
+			if !strings.Contains(m.chat[i].Text, thinkingHeader()) {
+				m.chat[i].Text += thinkingHeader() + "\n"
+			}
+			m.chat[i].Text += delta
+			m.chat[i].Tokens = tokens
+			m.chat[i].Ms = ms
+			if m.chat[i].At.IsZero() {
+				m.chat[i].At = time.Now()
+			}
+			return
+		}
+	}
+	m.chat = append(m.chat, chatLine{Role: "assistant", Text: thinkingHeader() + "\n" + delta, Tokens: tokens, Ms: ms, At: time.Now()})
+}
+
+func (m *tuiModel) finishAssistantStream(tokens int, ms int64) {
+	for i := len(m.chat) - 1; i >= 0; i-- {
+		if m.chat[i].Role == "assistant" {
+			if strings.TrimSpace(m.chat[i].Text) == "" {
+				m.chat[i].Text = "[empty response]"
+			}
+			if tokens > 0 {
+				m.chat[i].Tokens = tokens
+			}
+			if ms > 0 {
+				m.chat[i].Ms = ms
+			}
+			return
+		}
+	}
 }
 
 func (m tuiModel) updateSettingsScreen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -828,16 +1016,262 @@ func (m tuiModel) updateSettingsScreen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.adjustSetting(settings[m.settingSel], 1)
 		m.snap = m.state.fastSnapshot()
-	case "a":
-		m.busy = true
-		m.busyText = "Auto-optimizing cluster weights…"
-		return m, m.busyCmd("auto optimize", func() { tuiAutoWeighted(m.state) })
 	}
 	return m, nil
 }
 
+func (m tuiModel) updateAPIScreen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc", "q":
+		m.screen = ""
+		return m, nil
+	case "r", "R":
+		m.snap = m.state.fastSnapshot()
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m tuiModel) updateWorkerLayersScreen(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.coordinatorRunning() {
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc", "q":
+			m.screen = ""
+			return m, nil
+		}
+		return m, nil
+	}
+	m.state.mu.Lock()
+	n := len(m.state.config.Workers) + 1 // row 0 is LOCAL/coordinator
+	m.state.mu.Unlock()
+	if m.workerLayerSel >= n {
+		m.workerLayerSel = n - 1
+	}
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc", "q":
+		m.screen = ""
+		return m, nil
+	case "up", "k", "shift+tab":
+		m.workerLayerSel = (m.workerLayerSel - 1 + n) % n
+	case "down", "j", "tab":
+		m.workerLayerSel = (m.workerLayerSel + 1) % n
+	case "ctrl+up", "K":
+		if m.workerLayerSel > 0 {
+			m.moveWorkerOrder(m.workerLayerSel-1, -1)
+			if m.workerLayerSel > 1 {
+				m.workerLayerSel--
+			}
+			m.snap = m.state.fastSnapshot()
+		}
+	case "ctrl+down", "J":
+		if m.workerLayerSel > 0 {
+			m.moveWorkerOrder(m.workerLayerSel-1, 1)
+			if m.workerLayerSel < n-1 {
+				m.workerLayerSel++
+			}
+			m.snap = m.state.fastSnapshot()
+		}
+	case "left", "h":
+		m.adjustLayerRow(m.workerLayerSel, -1)
+		m.snap = m.state.fastSnapshot()
+	case "right", "l", "enter", " ":
+		m.adjustLayerRow(m.workerLayerSel, 1)
+		m.snap = m.state.fastSnapshot()
+	case "shift+left", "H":
+		m.adjustLayerRow(m.workerLayerSel, -4)
+		m.snap = m.state.fastSnapshot()
+	case "shift+right", "L":
+		m.adjustLayerRow(m.workerLayerSel, 4)
+		m.snap = m.state.fastSnapshot()
+	case "0":
+		m.setLayerRow(m.workerLayerSel, 0)
+		m.snap = m.state.fastSnapshot()
+	case "e":
+		if m.workerLayerSel > 0 {
+			m.toggleWorkerEnabled(m.workerLayerSel - 1)
+		}
+		m.snap = m.state.fastSnapshot()
+	case "a":
+		m.autoSeedWorkerLayers()
+		m.snap = m.state.fastSnapshot()
+	case "r":
+		m.resetWorkerLayers()
+		m.snap = m.state.fastSnapshot()
+	case "d", "D":
+		m.busy = true
+		m.busyText = "Discovering workers on LAN…"
+		return m, m.busyCmd("discover", func() { tuiDiscover(m.state) })
+	}
+	return m, nil
+}
+
+func (m tuiModel) adjustWorkerLayers(idx, delta int) {
+	m.state.mu.Lock()
+	cfg := m.state.config
+	if idx >= 0 && idx < len(cfg.Workers) {
+		cfg.Workers[idx].Layers = clampInt(cfg.Workers[idx].Layers+delta, 0, 999)
+		cfg.Workers[idx].SplitWeight = float64(cfg.Workers[idx].Layers)
+		cfg = applyManualWorkerLayersToConfig(cfg)
+		m.state.config = cfg
+	}
+	m.state.mu.Unlock()
+	_ = saveConfig(cfg)
+	m.state.addLog("worker layers updated: %s", layerPlanSummary(cfg, cfg.Workers))
+}
+
+func (m tuiModel) adjustLayerRow(row, delta int) {
+	if row == 0 {
+		m.state.mu.Lock()
+		cfg := m.state.config
+		cfg.CoordinatorLayers = clampInt(cfg.CoordinatorLayers+delta, 0, 999)
+		cfg = applyManualWorkerLayersToConfig(cfg)
+		m.state.config = cfg
+		m.state.mu.Unlock()
+		_ = saveConfig(cfg)
+		m.state.addLog("coordinator layers updated: %s", layerPlanSummary(cfg, cfg.Workers))
+		return
+	}
+	m.adjustWorkerLayers(row-1, delta)
+}
+
+func (m tuiModel) setLayerRow(row, layers int) {
+	if row == 0 {
+		m.state.mu.Lock()
+		cfg := m.state.config
+		cfg.CoordinatorLayers = clampInt(layers, 0, 999)
+		cfg = applyManualWorkerLayersToConfig(cfg)
+		m.state.config = cfg
+		m.state.mu.Unlock()
+		_ = saveConfig(cfg)
+		m.state.addLog("coordinator layers updated: %s", layerPlanSummary(cfg, cfg.Workers))
+		return
+	}
+	m.setWorkerLayers(row-1, layers)
+}
+
+func (m tuiModel) moveWorkerOrder(idx, delta int) {
+	m.state.mu.Lock()
+	cfg := m.state.config
+	to := idx + delta
+	if idx >= 0 && idx < len(cfg.Workers) && to >= 0 && to < len(cfg.Workers) {
+		cfg.Workers[idx], cfg.Workers[to] = cfg.Workers[to], cfg.Workers[idx]
+		cfg = applyManualWorkerLayersToConfig(cfg)
+		m.state.config = cfg
+	}
+	m.state.mu.Unlock()
+	_ = saveConfig(cfg)
+	m.state.addLog("worker order updated: %s", workerOrderSummary(cfg.Workers))
+}
+
+func workerOrderSummary(workers []Worker) string {
+	parts := make([]string, 0, len(workers))
+	for i, wk := range workers {
+		parts = append(parts, fmt.Sprintf("RPC%d=%s", i, short(firstNonEmpty(wk.Name, wk.Host), 12)))
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ",")
+}
+
+func (m tuiModel) setWorkerLayers(idx, layers int) {
+	m.state.mu.Lock()
+	cfg := m.state.config
+	if idx >= 0 && idx < len(cfg.Workers) {
+		cfg.Workers[idx].Layers = clampInt(layers, 0, 999)
+		cfg.Workers[idx].SplitWeight = float64(cfg.Workers[idx].Layers)
+		cfg = applyManualWorkerLayersToConfig(cfg)
+		m.state.config = cfg
+	}
+	m.state.mu.Unlock()
+	_ = saveConfig(cfg)
+	m.state.addLog("worker layers updated: %s", layerPlanSummary(cfg, cfg.Workers))
+}
+
+func (m tuiModel) toggleWorkerEnabled(idx int) {
+	m.state.mu.Lock()
+	cfg := m.state.config
+	if idx >= 0 && idx < len(cfg.Workers) {
+		cfg.Workers[idx].Disabled = !cfg.Workers[idx].Disabled
+		cfg = applyManualWorkerLayersToConfig(cfg)
+		m.state.config = cfg
+	}
+	m.state.mu.Unlock()
+	_ = saveConfig(cfg)
+	m.state.addLog("worker enabled toggled: %s", layerPlanSummary(cfg, cfg.Workers))
+}
+
+func (m tuiModel) resetWorkerLayers() {
+	m.state.mu.Lock()
+	cfg := m.state.config
+	cfg.CoordinatorLayers = 0
+	for i := range cfg.Workers {
+		cfg.Workers[i].Layers = 0
+		cfg.Workers[i].SplitWeight = 0
+	}
+	m.state.config = cfg
+	m.state.mu.Unlock()
+	_ = saveConfig(cfg)
+	m.state.addLog("manual layer plan cleared")
+}
+
+func (m tuiModel) autoSeedWorkerLayers() {
+	m.state.mu.Lock()
+	cfg := m.state.config
+	if len(cfg.Workers) == 0 {
+		m.state.mu.Unlock()
+		return
+	}
+	total := cfg.GPULayers
+	if total <= 0 {
+		total = 4
+	}
+	weights := make([]float64, len(cfg.Workers))
+	sum := 0.0
+	for i, w := range cfg.Workers {
+		if w.Disabled {
+			continue
+		}
+		weights[i] = workerUsableGB(w)
+		if weights[i] <= 0 {
+			weights[i] = 1
+		}
+		sum += weights[i]
+	}
+	allocated := 0
+	last := -1
+	for i := range cfg.Workers {
+		if cfg.Workers[i].Disabled || sum <= 0 {
+			cfg.Workers[i].Layers = 0
+			cfg.Workers[i].SplitWeight = 0
+			continue
+		}
+		last = i
+		layers := int(float64(total) * weights[i] / sum)
+		cfg.Workers[i].Layers = layers
+		allocated += layers
+	}
+	if last >= 0 {
+		cfg.Workers[last].Layers += total - allocated
+	}
+	for i := range cfg.Workers {
+		cfg.Workers[i].SplitWeight = float64(cfg.Workers[i].Layers)
+	}
+	cfg = applyManualWorkerLayersToConfig(cfg)
+	m.state.config = cfg
+	m.state.mu.Unlock()
+	_ = saveConfig(cfg)
+	m.state.addLog("auto worker layer seed: %s", layerPlanSummary(cfg, cfg.Workers))
+}
+
 func launchSettingKeys() []string {
-	return []string{"model", "context", "batch", "ubatch", "parallel", "threads", "gpuLayers", "cacheRam", "computeMode", "memoryMode", "workerPolicy", "weightedMode"}
+	return []string{"model", "context", "batch", "ubatch", "parallel", "threads", "gpuLayers", "cacheRam", "chatTimeout", "chatMaxTokens", "chatNoTokenLimit", "showThinking", "splitMode", "tensorSplit", "computeMode", "memoryMode", "coordinatorLocal"}
 }
 
 func (m tuiModel) adjustSetting(key string, dir int) {
@@ -864,10 +1298,29 @@ func (m tuiModel) adjustSetting(key string, dir int) {
 	case "threads":
 		cfg.Threads = clampInt(cfg.Threads+dir, 1, runtime.NumCPU())
 	case "gpuLayers":
-		cfg.GPULayers = clampInt(cfg.GPULayers+dir*4, 0, 999)
-		cfg.WeightedMode = false
+		cfg.GPULayers = clampInt(cfg.GPULayers+dir, 0, 999)
 	case "cacheRam":
 		cfg.CacheRAM = clampInt(cfg.CacheRAM+dir*512, 0, 32768)
+	case "chatTimeout":
+		cfg.ChatTimeout = clampInt(cfg.ChatTimeout+dir*60, 60, 86400)
+	case "chatMaxTokens":
+		cfg.ChatMaxTokens = stepPow2(cfg.ChatMaxTokens, dir, 64, 32768)
+	case "chatNoTokenLimit":
+		cfg.ChatNoTokenLimit = !cfg.ChatNoTokenLimit
+	case "showThinking":
+		cfg.HideThinking = !cfg.HideThinking
+	case "splitMode":
+		modes := []string{"layer", "row", "tensor", "none"}
+		idx := 0
+		for i, v := range modes {
+			if strings.EqualFold(splitMode(cfg), v) {
+				idx = i
+			}
+		}
+		cfg.SplitMode = modes[(idx+dir+len(modes))%len(modes)]
+	case "tensorSplit":
+		cfg = clearManualWorkerLayers(cfg)
+		cfg.TensorSplit = nextTensorSplitPreset(cfg, dir)
 	case "computeMode":
 		modes := []string{"auto", "gpu", "cpu"}
 		idx := 0
@@ -877,6 +1330,8 @@ func (m tuiModel) adjustSetting(key string, dir int) {
 			}
 		}
 		cfg.ComputeMode = modes[(idx+dir+len(modes))%len(modes)]
+	case "coordinatorLocal":
+		cfg.CoordinatorLocal = !cfg.CoordinatorLocal
 	case "memoryMode":
 		modes := []string{"normal", "mmap", "safest"}
 		idx := 0
@@ -897,31 +1352,6 @@ func (m tuiModel) adjustSetting(key string, dir int) {
 				cfg.Parallel = 1
 			}
 		}
-	case "workerPolicy":
-		policies := []string{"stable-only", "use-all-safe", "force-all"}
-		idx := 1
-		for i, v := range policies {
-			if strings.EqualFold(cfg.WorkerPolicy, v) {
-				idx = i
-			}
-		}
-		cfg.WorkerPolicy = policies[(idx+dir+len(policies))%len(policies)]
-		if cfg.WorkerPolicy == "use-all-safe" {
-			cfg.WeightedMode = true
-			cfg.MemoryMode = "safest"
-			if cfg.Batch > 64 {
-				cfg.Batch = 64
-			}
-			if cfg.UBatch > 32 {
-				cfg.UBatch = 32
-			}
-			if cfg.Parallel > 1 {
-				cfg.Parallel = 1
-			}
-		}
-	case "weightedMode":
-		cfg.WeightedMode = !cfg.WeightedMode
-		cfg.TensorSplit = ""
 	}
 	m.state.mu.Lock()
 	m.state.config = cfg
@@ -931,6 +1361,18 @@ func (m tuiModel) adjustSetting(key string, dir int) {
 }
 
 func (m tuiModel) adjustSettingFine(key string, dir int) {
+	if key == "chatMaxTokens" {
+		m.state.mu.Lock()
+		cfg := m.state.config
+		m.state.mu.Unlock()
+		cfg.ChatMaxTokens = stepLinear(cfg.ChatMaxTokens, dir, 100, 1, 32768)
+		m.state.mu.Lock()
+		m.state.config = cfg
+		m.state.mu.Unlock()
+		_ = saveConfig(cfg)
+		m.state.addLog("setting %s fine-adjusted", key)
+		return
+	}
 	if key != "context" {
 		m.adjustSetting(key, dir)
 		return
@@ -1134,19 +1576,30 @@ func memoryMode(cfg Config) string {
 	}
 }
 
-func workerPolicy(cfg Config) string {
-	policy := strings.ToLower(strings.TrimSpace(cfg.WorkerPolicy))
-	switch policy {
-	case "stable-only", "force-all":
-		return policy
+func splitMode(cfg Config) string {
+	mode := strings.ToLower(strings.TrimSpace(cfg.SplitMode))
+	switch mode {
+	case "none", "layer", "row", "tensor":
+		return mode
 	default:
-		return "use-all-safe"
+		return "layer"
 	}
+}
+
+func isCoordinatorRole(cfg Config) bool {
+	return cfg.RoleExplicit && strings.EqualFold(cfg.Role, "coordinator")
+}
+
+func isWorkerRole(cfg Config) bool {
+	return cfg.RoleExplicit && strings.EqualFold(cfg.Role, "worker")
 }
 
 func tuiDiscover(s *AppState) {
 	peers := discoverPeers(1400 * time.Millisecond)
 	workers := make([]Worker, 0, len(peers))
+	s.mu.Lock()
+	previous := append([]Worker(nil), s.config.Workers...)
+	s.mu.Unlock()
 	for _, p := range peers {
 		w := Worker{Name: p.Name, Host: p.Host, Port: p.Port, OS: p.OS, Arch: p.Arch, RAMBytes: p.RAM, VRAMBytes: p.VRAMBytes, Backend: p.Backend, Threads: p.Threads, CrashCount: p.CrashCount, Stability: p.Stability, RSSBytes: p.RSSBytes, LoadPct: p.LoadPct, Status: "discovered"}
 		if w.Port == 0 {
@@ -1154,6 +1607,7 @@ func tuiDiscover(s *AppState) {
 		}
 		workers = append(workers, w)
 	}
+	workers = mergeManualWorkerSettings(workers, previous)
 	workers = s.classifyWorkers(workers, 650*time.Millisecond)
 	s.mu.Lock()
 	cfg := s.config
@@ -1164,26 +1618,40 @@ func tuiDiscover(s *AppState) {
 	s.addLog("discovered %d worker(s)", len(workers))
 }
 
-func tuiAutoWeighted(s *AppState) {
-	s.mu.Lock()
-	cfg := s.config
-	s.mu.Unlock()
-	workers := s.classifyWorkers(append([]Worker(nil), cfg.Workers...), 650*time.Millisecond)
-	plan := buildWeightedPlan(cfg, workers, hardwareInfo())
-	cfg.Context = plan.Context
-	cfg.GPULayers = plan.GPULayers
-	cfg.WeightedMode = true
-	cfg.Threads = plan.Threads
-	cfg.Parallel = plan.Parallel
-	cfg.Batch = plan.Batch
-	cfg.UBatch = plan.UBatch
-	cfg.TensorSplit = ""
-	cfg.Workers = workers
-	s.mu.Lock()
-	s.config = cfg
-	s.mu.Unlock()
-	_ = saveConfig(cfg)
-	s.addLog("auto weighted applied: ctx=%d batch=%d ubatch=%d", cfg.Context, cfg.Batch, cfg.UBatch)
+func mergeManualWorkerSettings(workers, previous []Worker) []Worker {
+	byKey := map[string]Worker{}
+	byHost := map[string]Worker{}
+	for _, old := range previous {
+		if old.Host == "" {
+			continue
+		}
+		byHost[old.Host] = old
+		p := old.Port
+		if p == 0 {
+			p = 50052
+		}
+		byKey[fmt.Sprintf("%s:%d", old.Host, p)] = old
+	}
+	for i := range workers {
+		p := workers[i].Port
+		if p == 0 {
+			p = 50052
+		}
+		old, ok := byKey[fmt.Sprintf("%s:%d", workers[i].Host, p)]
+		if !ok {
+			old, ok = byHost[workers[i].Host]
+		}
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(old.Name) != "" {
+			workers[i].Name = old.Name
+		}
+		workers[i].Disabled = old.Disabled
+		workers[i].Layers = old.Layers
+		workers[i].SplitWeight = old.SplitWeight
+	}
+	return workers
 }
 
 func (m tuiModel) View() string {
@@ -1208,6 +1676,12 @@ func (m tuiModel) View() string {
 	if m.screen == "settings" {
 		return s.base.Render(m.settingsView(boxW))
 	}
+	if m.screen == "api" {
+		return s.base.Render(m.apiView(boxW))
+	}
+	if m.screen == "workerLayers" {
+		return s.base.Render(m.workerLayersView(boxW))
+	}
 	if m.screen == "chat" {
 		return s.base.Render(m.chatView(boxW))
 	}
@@ -1223,13 +1697,13 @@ func (m tuiModel) View() string {
 	cluster := m.box("ClusterKit", boxW, []string{
 		"local llama.cpp cluster",
 		fmt.Sprintf("role %-11s node %-15s system %s/%s", cfg.Role, snap["localIP"], snap["os"], snap["arch"]),
-		"steps: install → discover → auto optimize → start",
+		"steps: install → discover → tune manually → start",
 	})
 	status := m.box("Status", boxW, []string{
 		fmt.Sprintf("llama.cpp %-9s compute %-7s api 127.0.0.1:%s", yesNo(snap["llamaReady"].(bool)), cfg.ComputeMode, portOnly(m.addr)),
 		fmt.Sprintf("worker %-9s coordinator %s model %s", yesNo(snap["workerRunning"].(bool)), m.coordinatorStatusBadge(snap), m.modelStatusBadge(safeString(snap["modelStatus"]))),
 		fmt.Sprintf("model detail: %s", safeString(snap["serverLoad"])),
-		fmt.Sprintf("ctx %-6d batch %-5d ubatch %-5d parallel %-2d weighted %v", cfg.Context, cfg.Batch, cfg.UBatch, cfg.Parallel, cfg.WeightedMode),
+		fmt.Sprintf("ctx %-6d batch %-5d ubatch %-5d parallel %-2d", cfg.Context, cfg.Batch, cfg.UBatch, cfg.Parallel),
 	})
 	clusterPanel := m.clusterCapacityPanel(boxW, snap, cfg)
 	launchPanel := m.launchSettingsPanel(boxW, cfg)
@@ -1267,11 +1741,15 @@ func (m tuiModel) View() string {
 		} else if w.Status == "busy/agent" {
 			rpc = s.warn.Render("agent only")
 		}
-		workerRows = append(workerRows, fmt.Sprintf("%-18s %-15s %-12s %s %-10s RAM %7s VRAM %7s load %5.0f%% crash %d", short(w.Name, 18), short(w.Host, 15), short(w.Backend, 12), status, rpc, humanBytes(w.RAMBytes), humanBytes(w.VRAMBytes), w.LoadPct, w.CrashCount))
+		layerLabel := fmt.Sprintf("L%-3d", w.Layers)
+		if w.Disabled {
+			layerLabel = "off"
+		}
+		workerRows = append(workerRows, fmt.Sprintf("%-18s %-15s %-12s %s %-10s %-4s RAM %7s VRAM %7s load %5.0f%% crash %d", short(w.Name, 18), short(w.Host, 15), short(w.Backend, 12), status, rpc, layerLabel, humanBytes(w.RAMBytes), humanBytes(w.VRAMBytes), w.LoadPct, w.CrashCount))
 	}
 	workersBox := m.box("Workers", boxW, workerRows)
 
-	help := s.muted.Render("↑/↓/←/→ or Tab: navigate   Enter: run   I/W/C/D/A: hotkeys   Esc/Q: quit")
+	help := s.muted.Render(terminalText("↑/↓/←/→ or Tab: navigate   Enter: run   I/W/C/D/A/L: hotkeys   Esc/Q: quit"))
 	parts := []string{cluster, status, clusterPanel, launchPanel, menu}
 	if m.busy {
 		parts = append(parts, m.loadingBox(boxW))
@@ -1441,27 +1919,33 @@ func (m tuiModel) clusterCapacityPanel(width int, snap map[string]any, cfg Confi
 	rows := []string{
 		fmt.Sprintf("nodes %d total (%d connected workers) • local %s • %s", len(workers)+1, connected, runtime.GOOS, hw.Backend),
 		fmt.Sprintf("RAM %s total • VRAM %s total • usable estimate %.1fG", humanBytes(totalRAM), humanBytes(totalVRAM), usable),
-		fmt.Sprintf("workers configured %d • discover with [D] • auto tune with [A]", len(workers)),
+		fmt.Sprintf("workers configured %d • discover with [D]", len(workers)),
 	}
 	return m.box("Cluster capacity", width, rows)
 }
 
 func (m tuiModel) launchSettingsPanel(width int, cfg Config) string {
 	mode := "manual"
-	if cfg.WeightedMode {
-		mode = "auto weighted"
-	}
 	model := "none"
 	if strings.TrimSpace(cfg.ModelPath) != "" {
 		model = filepath.Base(cfg.ModelPath)
 	}
+	appPort := m.state.appPort
+	if appPort == 0 {
+		appPort = 8765
+	}
 	rows := []string{
+		fmt.Sprintf("OpenAI API http://127.0.0.1:%d/v1", appPort),
 		fmt.Sprintf("model %s • [M] select existing • [B] browse/download", model),
-		fmt.Sprintf("mode %s • compute %s • memory %s • workers %s", mode, cfg.ComputeMode, memoryMode(cfg), workerPolicy(cfg)),
-		fmt.Sprintf("gpu-layers %d • threads %d", cfg.GPULayers, cfg.Threads),
+		fmt.Sprintf("mode %s • compute %s • memory %s", mode, cfg.ComputeMode, memoryMode(cfg)),
+		fmt.Sprintf("GPU/RPC layers %d • layer plan %s • threads %d", cfg.GPULayers, layerPlanSummary(cfg, cfg.Workers), cfg.Threads),
 		fmt.Sprintf("context %d • batch %d • ubatch %d • parallel %d • cache-ram %d", cfg.Context, cfg.Batch, cfg.UBatch, cfg.Parallel, cfg.CacheRAM),
-		"auto tuning: [A] Auto Optimize Weighted — recalculates safe ctx/batch/ubatch/worker weights",
+		"minimal: set compute CPU or gpu-layers 0; ClusterKit will not auto-overrule it",
+		"coordinator compute off: local machine hosts API only; RPC workers get layer weights",
 		"start: [C] Start coordinator uses these settings; logs open in separate Terminal",
+	}
+	if cfg.GPULayers == 0 && len(cfg.Workers) > 0 {
+		rows = append(rows, m.styles.warn.Render("workers will stay mostly idle: GPU/RPC layers is 0. Set it above 0 to offload model layers to RPC workers."))
 	}
 	if m.coordinatorRunning() {
 		rows = append(rows, m.styles.warn.Render("locked: stop coordinator to edit model/launch settings"))
@@ -1550,6 +2034,70 @@ func (m tuiModel) modelBrowserView(width int) string {
 	return m.box(title, width, rows)
 }
 
+func (m tuiModel) apiView(width int) string {
+	s := m.styles
+	m.state.mu.Lock()
+	cfg := m.state.config
+	appPort := m.state.appPort
+	coordinatorRunning := m.state.serverCmd != nil && m.state.serverCmd.Process != nil
+	serverLoad := m.state.serverLoad
+	m.state.mu.Unlock()
+	if appPort == 0 {
+		appPort = 8765
+	}
+	lanIP := localIP()
+	if lanIP == "" {
+		lanIP = "<this-machine-lan-ip>"
+	}
+	localBase := fmt.Sprintf("http://127.0.0.1:%d/v1", appPort)
+	lanBase := fmt.Sprintf("http://%s:%d/v1", lanIP, appPort)
+	localRoot := fmt.Sprintf("http://127.0.0.1:%d", appPort)
+	lanRoot := fmt.Sprintf("http://%s:%d", lanIP, appPort)
+	coordBase := fmt.Sprintf("http://127.0.0.1:%d/v1", cfg.APIPort)
+	coordReachable := coordinatorPortReachable(cfg.APIPort)
+	status := "unavailable"
+	if coordinatorRunning || coordReachable {
+		status = "ok"
+	}
+	model := "clusterkit-local"
+	if strings.TrimSpace(cfg.ModelPath) != "" {
+		model = filepath.Base(cfg.ModelPath)
+	}
+	rows := []string{
+		s.muted.Render("Esc/Q: back   R: refresh"),
+		fmt.Sprintf("status %-12s coordinator process %-5s coordinator port %-5s", status, onOff(coordinatorRunning), onOff(coordReachable)),
+		fmt.Sprintf("model  %s", model),
+		fmt.Sprintf("load   %s", firstNonEmpty(serverLoad, "unknown")),
+		"",
+		"Use on this machine:",
+		fmt.Sprintf("  base_url    %s", localBase),
+		fmt.Sprintf("  health      %s/health", localRoot),
+		fmt.Sprintf("  models      %s/models", localBase),
+		fmt.Sprintf("  chat        %s/chat/completions", localBase),
+		fmt.Sprintf("  completions %s/completions", localBase),
+		"",
+		"Use from another device on the same LAN:",
+		fmt.Sprintf("  base_url    %s", lanBase),
+		fmt.Sprintf("  health      %s/health", lanRoot),
+		fmt.Sprintf("  models      %s/models", lanBase),
+		fmt.Sprintf("  chat        %s/chat/completions", lanBase),
+		fmt.Sprintf("  completions %s/completions", lanBase),
+		"",
+		"Compatibility aliases if a client wants server root instead of /v1:",
+		fmt.Sprintf("  root        %s", localRoot),
+		fmt.Sprintf("  LAN root    %s", lanRoot),
+		"  aliases     /models  /chat/completions  /completions",
+		"",
+		"Upstream coordinator (internal llama-server):",
+		fmt.Sprintf("  %s", coordBase),
+	}
+	if status != "ok" {
+		rows = append(rows, "", s.warn.Render("OpenAI endpoints are visible now, but generation needs [C] Start coordinator first."))
+	}
+	rows = append(rows, "", s.muted.Render("For OpenAI SDK: api_key can be any non-empty string; model can be clusterkit-local or the listed model id."))
+	return m.box("API endpoints", width, rows)
+}
+
 func (m tuiModel) settingsView(width int) string {
 	s := m.styles
 	if m.coordinatorRunning() {
@@ -1569,37 +2117,47 @@ func (m tuiModel) settingsView(width int) string {
 		}
 	}
 	vals := map[string]string{
-		"model":        "none",
-		"context":      fmt.Sprintf("%d / max %d", cfg.Context, maxCtx),
-		"batch":        fmt.Sprintf("%d", cfg.Batch),
-		"ubatch":       fmt.Sprintf("%d", cfg.UBatch),
-		"parallel":     fmt.Sprintf("%d", cfg.Parallel),
-		"threads":      fmt.Sprintf("%d", cfg.Threads),
-		"gpuLayers":    fmt.Sprintf("%d", cfg.GPULayers),
-		"cacheRam":     fmt.Sprintf("%d MiB", cfg.CacheRAM),
-		"computeMode":  cfg.ComputeMode,
-		"memoryMode":   memoryMode(cfg),
-		"workerPolicy": workerPolicy(cfg),
-		"weightedMode": fmt.Sprintf("%v", cfg.WeightedMode),
+		"model":            "none",
+		"context":          fmt.Sprintf("%d / max %d", cfg.Context, maxCtx),
+		"batch":            fmt.Sprintf("%d", cfg.Batch),
+		"ubatch":           fmt.Sprintf("%d", cfg.UBatch),
+		"parallel":         fmt.Sprintf("%d", cfg.Parallel),
+		"threads":          fmt.Sprintf("%d", cfg.Threads),
+		"gpuLayers":        fmt.Sprintf("%d", cfg.GPULayers),
+		"cacheRam":         fmt.Sprintf("%d MiB", cfg.CacheRAM),
+		"chatTimeout":      fmt.Sprintf("%d sec", chatTimeoutSec(cfg)),
+		"chatMaxTokens":    fmt.Sprintf("%d", defaultChatMaxTokens(cfg)),
+		"chatNoTokenLimit": yesNo(cfg.ChatNoTokenLimit),
+		"showThinking":     onOff(!cfg.HideThinking),
+		"splitMode":        splitMode(cfg),
+		"tensorSplit":      displayTensorSplit(cfg),
+		"computeMode":      cfg.ComputeMode,
+		"memoryMode":       memoryMode(cfg),
+		"coordinatorLocal": yesNo(cfg.CoordinatorLocal),
 	}
 	if strings.TrimSpace(cfg.ModelPath) != "" {
 		vals["model"] = filepath.Base(cfg.ModelPath)
 	}
 	labels := map[string]string{
-		"model":        "Model",
-		"context":      "Context window",
-		"batch":        "Batch size",
-		"ubatch":       "Micro batch",
-		"parallel":     "Parallel slots",
-		"threads":      "CPU threads",
-		"gpuLayers":    "GPU layers",
-		"cacheRam":     "KV cache RAM",
-		"computeMode":  "Compute mode",
-		"memoryMode":   "Memory mode",
-		"workerPolicy": "Worker policy",
-		"weightedMode": "Auto weighted mode",
+		"model":            "Model",
+		"context":          "Context window",
+		"batch":            "Batch size",
+		"ubatch":           "Micro batch",
+		"parallel":         "Parallel slots",
+		"threads":          "CPU threads",
+		"gpuLayers":        "GPU/RPC layers",
+		"cacheRam":         "KV cache RAM",
+		"chatTimeout":      "Chat timeout",
+		"chatMaxTokens":    "Max output tokens",
+		"chatNoTokenLimit": "No token limit",
+		"showThinking":     "Show model thinking",
+		"splitMode":        "Split mode",
+		"tensorSplit":      "Tensor split",
+		"computeMode":      "Compute mode",
+		"memoryMode":       "Memory mode",
+		"coordinatorLocal": "Coordinator compute",
 	}
-	rows := []string{s.muted.Render("↑/↓ select   ←/→ change   Shift+←/→ context ±500   A auto optimize   Esc back")}
+	rows := []string{s.muted.Render("↑/↓ select   ←/→ change   Shift+←/→ fine adjust context/tokens   Esc back")}
 	for i, key := range launchSettingKeys() {
 		row := fmt.Sprintf("%-20s • %s", labels[key], vals[key])
 		if i == m.settingSel {
@@ -1609,8 +2167,59 @@ func (m tuiModel) settingsView(width int) string {
 		}
 		rows = append(rows, row)
 	}
-	rows = append(rows, "", s.muted.Render("Context: ←/→ powers of two, Shift+←/→ ±500. Batch/ubatch: powers of two."))
+	rows = append(rows, "", s.muted.Render("Tensor split: ←/→ cycles auto/equal/usable/layer-plan. For exact per-worker layer tests use [L]."))
 	return m.box("Launch settings", width, rows)
+}
+
+func (m tuiModel) workerLayersView(width int) string {
+	s := m.styles
+	if m.coordinatorRunning() {
+		return m.box("Worker layers locked", width, []string{
+			s.warn.Render("Coordinator is running."),
+			"Stop coordinator before changing per-worker layer routing.",
+			s.muted.Render("Esc/Q: back"),
+		})
+	}
+	m.state.mu.Lock()
+	cfg := m.state.config
+	m.state.mu.Unlock()
+	workers := cfg.Workers
+	if m.workerLayerSel >= len(workers)+1 {
+		m.workerLayerSel = len(workers)
+	}
+	rows := []string{
+		s.muted.Render("↑/↓ select   Ctrl+↑/↓ move RPC workers only   ←/→ layers ±1   Shift+←/→ ±4   0 zero   E enable/disable worker   A auto   R reset   Esc back"),
+		fmt.Sprintf("RPC order %s • plan %s • total %d • config GPU/RPC layers %d", workerOrderSummary(workers), layerPlanSummary(cfg, workers), manualLayerTotal(cfg, workers), cfg.GPULayers),
+		"",
+	}
+	localLine := fmt.Sprintf("LOCAL %-18s %-15s %-10s layers %-3d enable %-3s RAM %7s VRAM %7s", "coordinator", "127.0.0.1", "LOCAL", cfg.CoordinatorLayers, yesNo(cfg.CoordinatorLayers > 0), humanBytes(hardwareInfo().RAMBytes), humanBytes(hardwareInfo().VRAMBytes))
+	if m.workerLayerSel == 0 {
+		localLine = s.selected.Render(padRight("❯ "+localLine, width-8))
+	} else if cfg.CoordinatorLayers == 0 {
+		localLine = "  " + s.muted.Render(localLine)
+	} else {
+		localLine = "  " + localLine
+	}
+	rows = append(rows, localLine)
+	for i, w := range workers {
+		status := strings.ToUpper(firstNonEmpty(w.Status, "unknown"))
+		enabled := "on"
+		if w.Disabled {
+			enabled = "off"
+		}
+		line := fmt.Sprintf("RPC%-2d %-18s %-15s %s layers %-3d enable %-3s RAM %7s VRAM %7s crash %d", i, short(firstNonEmpty(w.Name, w.Host), 18), short(w.Host, 15), short(status, 10), w.Layers, enabled, humanBytes(w.RAMBytes), humanBytes(w.VRAMBytes), w.CrashCount)
+		rowIndex := i + 1
+		if rowIndex == m.workerLayerSel {
+			line = s.selected.Render(padRight("❯ "+line, width-8))
+		} else if w.Disabled || w.Layers == 0 {
+			line = "  " + s.muted.Render(line)
+		} else {
+			line = "  " + line
+		}
+		rows = append(rows, line)
+	}
+	rows = append(rows, "", s.muted.Render("LOCAL is fixed local compute, not part of RPC order. Active workers below are RPC0, RPC1… Tensor-split follows RPC order after any LOCAL value."))
+	return m.box("Worker layers", width, rows)
 }
 
 func (m tuiModel) chatView(width int) string {
@@ -1668,19 +2277,57 @@ func (m tuiModel) chatView(width int) string {
 	if cfg.ModelPath != "" {
 		model = filepath.Base(cfg.ModelPath)
 	}
+	contextTokens := estimateChatContextTokens(m.chat, m.chatIn.Value())
 	input := m.box("Prompt", width, []string{
 		m.chatIn.View(),
 		s.muted.Render("Enter: send   Ctrl+K: clear chat/context   Esc: back"),
-		s.muted.Render(fmt.Sprintf("model: %s • context: %s • tokens: %d / %d", short(model, max(16, inner-42)), ctxLabel, m.chatUsed, ctx)),
+		s.muted.Render(fmt.Sprintf("model: %s • context: %s • prompt ctx: ~%d / %d tok • last total: %d • thinking: %s", short(model, max(16, inner-62)), ctxLabel, contextTokens, ctx, m.chatUsed, onOff(m.showThinking()))),
 	})
 	return lipgloss.JoinVertical(lipgloss.Left, chatBox, input)
+}
+
+func estimateChatContextTokens(lines []chatLine, draft string) int {
+	estimateLines := make([]chatLine, 0, len(lines)+1)
+	estimateLines = append(estimateLines, lines...)
+	if strings.TrimSpace(draft) != "" {
+		estimateLines = append(estimateLines, chatLine{Role: "user", Text: draft})
+	}
+	messages := chatMessagesForModel(estimateLines)
+	tokens := 0
+	for _, msg := range messages {
+		// Chat templates add role/control tokens around every message. This is an
+		// intentionally conservative live estimate for the TUI footer; exact counts
+		// require model-specific tokenization after the request reaches llama.cpp.
+		tokens += 6
+		tokens += estimateTextTokens(msg["role"])
+		tokens += estimateTextTokens(msg["content"])
+	}
+	// Assistant generation prefix / final template overhead.
+	return tokens + 4
+}
+
+func estimateTextTokens(text string) int {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0
+	}
+	runes := []rune(text)
+	words := strings.Fields(text)
+	// Mixed-language approximation: Latin text is usually ~4 chars/token,
+	// Cyrillic/CJK and punctuation-heavy text are closer to rune-based counts.
+	byChars := (len(runes) + 3) / 4
+	byWords := int(float64(len(words))*1.35) + 1
+	if byWords > byChars {
+		return byWords
+	}
+	return byChars
 }
 
 func chatMessagesForModel(lines []chatLine) []map[string]string {
 	messages := make([]map[string]string, 0, len(lines)+1)
 	messages = append(messages, map[string]string{
 		"role":    "system",
-		"content": "You are a helpful local chat assistant. Use the conversation history for context and answer the latest user message.",
+		"content": "You are a helpful local chat assistant. Answer in the user's language. If you use hidden reasoning, keep it brief, finish it, then provide the final answer. Do not continue indefinitely, do not repeat zeros, and stop when the answer is complete.",
 	})
 	for _, line := range lines {
 		role := line.Role
@@ -1709,6 +2356,12 @@ func chatLineMeta(line chatLine) string {
 	}
 	if line.Tokens > 0 {
 		parts = append(parts, fmt.Sprintf("%d tok", line.Tokens))
+		if line.Ms > 0 {
+			sec := float64(line.Ms) / 1000
+			if sec > 0 {
+				parts = append(parts, fmt.Sprintf("%.1f tok/s", float64(line.Tokens)/sec))
+			}
+		}
 	}
 	if len(parts) == 0 {
 		return ""
@@ -1786,12 +2439,50 @@ func (m tuiModel) loadingBox(width int) string {
 	})
 }
 
+func asciiTUI() bool {
+	return runtime.GOOS == "windows" || os.Getenv("CLUSTERKIT_ASCII") == "1"
+}
+
+func thinkingHeader() string {
+	if asciiTUI() {
+		return "Thinking:"
+	}
+	return "🧠 Thinking:"
+}
+
+func terminalText(s string) string {
+	if !asciiTUI() || s == "" {
+		return s
+	}
+	replacer := strings.NewReplacer(
+		"🧠 ", "",
+		"🧠", "",
+		"❯", ">",
+		"•", "-",
+		"↑", "Up",
+		"↓", "Down",
+		"←", "Left",
+		"→", "Right",
+		"±", "+/-",
+		"…", "...",
+		"—", "-",
+		"–", "-",
+		"‑", "-",
+		"Wi‑Fi", "Wi-Fi",
+		"●", "*",
+		"○", "o",
+		"◐", "~",
+		"✓", "x",
+	)
+	return replacer.Replace(s)
+}
+
 func (m tuiModel) box(title string, width int, rows []string) string {
 	inner := max(20, width-4)
 	clean := make([]string, 0, len(rows)+1)
-	clean = append(clean, m.styles.title.Render(title))
+	clean = append(clean, m.styles.title.Render(terminalText(title)))
 	for _, row := range rows {
-		clean = append(clean, clipVisible(row, inner))
+		clean = append(clean, clipVisible(terminalText(row), inner))
 	}
 	return m.styles.box.Width(width).Render(lipgloss.JoinVertical(lipgloss.Left, clean...))
 }
@@ -1835,6 +2526,7 @@ func (m tuiModel) modelStatusBadge(status string) string {
 }
 
 func padRight(s string, n int) string {
+	s = terminalText(s)
 	if lipgloss.Width(s) >= n {
 		return s
 	}
@@ -1842,18 +2534,40 @@ func padRight(s string, n int) string {
 }
 
 func clipVisible(s string, n int) string {
+	ellipsis := ellipsis()
 	if lipgloss.Width(s) <= n {
 		return s
 	}
 	runes := []rune(s)
 	out := ""
 	for _, r := range runes {
-		if lipgloss.Width(out+string(r)+"…") > n {
+		if lipgloss.Width(out+string(r)+ellipsis) > n {
 			break
 		}
 		out += string(r)
 	}
-	return out + "…"
+	return out + ellipsis
+}
+
+func ellipsis() string {
+	if asciiTUI() {
+		return "..."
+	}
+	return "…"
+}
+
+func dash() string {
+	if asciiTUI() {
+		return "-"
+	}
+	return "—"
+}
+
+func onOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
 }
 
 func yesNo(v bool) string {
@@ -1901,12 +2615,12 @@ func short(s string, n int) string {
 	if n <= 1 {
 		return s[:n]
 	}
-	return s[:n-1] + "…"
+	return s[:n-1] + ellipsis()
 }
 
 func humanBytes(v uint64) string {
 	if v == 0 {
-		return "—"
+		return dash()
 	}
 	gb := float64(v) / 1024 / 1024 / 1024
 	if gb >= 1 {
@@ -1931,24 +2645,35 @@ func (s *AppState) autostartWorker() {
 
 func defaultConfig() Config {
 	return Config{
-		Role:         "",
-		RoleExplicit: false,
-		APIPort:      8080,
-		RPCPort:      50052,
-		LlamaDir:     defaultLlamaDir(),
-		ModelsDir:    defaultModelsDir(),
-		Context:      4096,
-		GPULayers:    20,
-		Threads:      max(1, runtime.NumCPU()-1),
-		Parallel:     1,
-		CacheRAM:     0,
-		Batch:        512,
-		UBatch:       512,
-		ComputeMode:  "auto",
-		MemoryMode:   "normal",
-		WorkerPolicy: "use-all-safe",
-		Workers:      []Worker{},
+		Role:             "",
+		RoleExplicit:     false,
+		APIPort:          8080,
+		RPCPort:          50052,
+		LlamaDir:         defaultLlamaDir(),
+		ModelsDir:        defaultModelsDir(),
+		Context:          4096,
+		GPULayers:        0,
+		Threads:          max(1, runtime.NumCPU()-1),
+		Parallel:         1,
+		CacheRAM:         0,
+		ChatTimeout:      1800,
+		Batch:            64,
+		UBatch:           32,
+		SplitMode:        "layer",
+		ComputeMode:      "auto",
+		MemoryMode:       "mmap",
+		CoordinatorLocal: true,
+		Workers:          []Worker{},
 	}
+}
+
+func resetStartupRole(cfg Config) Config {
+	// Role is intentionally session-scoped. Persisting coordinator/worker caused
+	// surprising side effects on the next launch: worker probing, discovery
+	// announcements, and autostart before the user picked this machine's role.
+	cfg.Role = ""
+	cfg.RoleExplicit = false
+	return cfg
 }
 
 func localListener(preferredPort int) (net.Listener, string, error) {
@@ -2030,9 +2755,6 @@ func saveConfig(cfg Config) error {
 	if cfg.Context == 0 {
 		cfg.Context = 4096
 	}
-	if cfg.GPULayers == 0 && !cfg.WeightedMode && !strings.EqualFold(cfg.ComputeMode, "cpu") {
-		cfg.GPULayers = 20
-	}
 	if cfg.Threads == 0 {
 		cfg.Threads = max(1, runtime.NumCPU()-1)
 	}
@@ -2045,15 +2767,20 @@ func saveConfig(cfg Config) error {
 	if cfg.UBatch == 0 {
 		cfg.UBatch = 512
 	}
+	if cfg.ChatTimeout == 0 {
+		cfg.ChatTimeout = 1800
+	}
 	if cfg.ComputeMode == "" {
 		cfg.ComputeMode = "auto"
 	}
 	if cfg.MemoryMode == "" {
 		cfg.MemoryMode = "normal"
 	}
-	if cfg.WorkerPolicy == "" {
-		cfg.WorkerPolicy = "use-all-safe"
-	}
+	cfg.SplitMode = splitMode(cfg)
+	// Legacy fields kept in Config only for old config.json compatibility. They
+	// must not affect launches: user-entered gpuLayers/batch/ubatch are strict.
+	cfg.WorkerPolicy = ""
+	cfg.WeightedMode = false
 	if cfg.LlamaDir == "" {
 		cfg.LlamaDir = defaultLlamaDir()
 	}
@@ -2062,6 +2789,18 @@ func saveConfig(cfg Config) error {
 	}
 	b, _ := json.MarshalIndent(cfg, "", "  ")
 	return os.WriteFile(configPath(), b, 0644)
+}
+
+func chatTimeoutSec(cfg Config) int {
+	sec := cfg.ChatTimeout
+	if sec <= 0 {
+		sec = 1800
+	}
+	return clampInt(sec, 30, 86400)
+}
+
+func chatTimeoutDuration(cfg Config) time.Duration {
+	return time.Duration(chatTimeoutSec(cfg)) * time.Second
 }
 
 func (s *AppState) addLog(format string, args ...any) {
@@ -2166,17 +2905,22 @@ func coordinatorAPIHealth(port int, running bool) string {
 }
 
 func (s *AppState) snapshot() map[string]any {
-	workerStatuses := s.workerStatuses()
 	s.mu.Lock()
 	cfg := s.config
 	workerRunning := s.workerCmd != nil && s.workerCmd.Process != nil
 	coordinatorRunning := s.serverCmd != nil && s.serverCmd.Process != nil
 	serverLoad := s.serverLoad
 	serverContext := s.serverContext
+	serverRPC := s.serverRPC
 	loadStarted := s.loadStarted
 	loadReady := s.loadReady
+	download := s.download
 	logs := append([]string(nil), s.logs...)
 	s.mu.Unlock()
+	workerStatuses := append([]Worker(nil), cfg.Workers...)
+	if isCoordinatorRole(cfg) {
+		workerStatuses = s.workerStatusesFor(cfg)
+	}
 	modelStatus := effectiveCoordinatorStatus(coordinatorRunning, serverLoad, coordinatorAPIHealth(cfg.APIPort, coordinatorRunning))
 	return map[string]any{
 		"config":             cfg,
@@ -2188,6 +2932,7 @@ func (s *AppState) snapshot() map[string]any {
 		"coordinatorRunning": coordinatorRunning,
 		"serverLoad":         serverLoad,
 		"serverContext":      serverContext,
+		"serverRPC":          serverRPC,
 		"modelStatus":        modelStatus,
 		"loadStartedMs":      millisSince(loadStarted),
 		"loadReadyMs":        millisSince(loadReady),
@@ -2197,6 +2942,7 @@ func (s *AppState) snapshot() map[string]any {
 		"modelsDir":          modelsDir(cfg),
 		"llamaReady":         installStatus(cfg).Ready,
 		"installStatus":      installStatus(cfg),
+		"download":           download,
 	}
 }
 
@@ -2209,8 +2955,10 @@ func (s *AppState) fastSnapshot() map[string]any {
 	coordinatorRunning := s.serverCmd != nil && s.serverCmd.Process != nil
 	serverLoad := s.serverLoad
 	serverContext := s.serverContext
+	serverRPC := s.serverRPC
 	loadStarted := s.loadStarted
 	loadReady := s.loadReady
+	download := s.download
 	s.mu.Unlock()
 	modelStatus := effectiveCoordinatorStatus(coordinatorRunning, serverLoad, coordinatorAPIHealth(cfg.APIPort, coordinatorRunning))
 	return map[string]any{
@@ -2223,6 +2971,7 @@ func (s *AppState) fastSnapshot() map[string]any {
 		"coordinatorRunning": coordinatorRunning,
 		"serverLoad":         serverLoad,
 		"serverContext":      serverContext,
+		"serverRPC":          serverRPC,
 		"modelStatus":        modelStatus,
 		"loadStartedMs":      millisSince(loadStarted),
 		"loadReadyMs":        millisSince(loadReady),
@@ -2232,6 +2981,7 @@ func (s *AppState) fastSnapshot() map[string]any {
 		"modelsDir":          modelsDir(cfg),
 		"llamaReady":         fileExists(llamaBin(cfg.LlamaDir, "llama-server")) && fileExists(llamaBin(cfg.LlamaDir, "rpc-server")),
 		"installStatus":      InstallStatus{},
+		"download":           download,
 	}
 }
 
@@ -2285,6 +3035,8 @@ func (s *AppState) handleSave(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.config = cfg
+	s.workerStatusAt = time.Time{}
+	s.workerStatusCache = nil
 	s.mu.Unlock()
 	s.addLog("config saved")
 	writeJSON(w, map[string]bool{"ok": true})
@@ -2457,6 +3209,20 @@ func (s *AppState) startCoordinatorProcess(cfg Config, resetFallback bool) error
 		cfg.Workers = s.waitForRPCWorkers(cfg, 3*time.Second)
 	}
 	reachableWorkers := policyOnlineWorkers(cfg.Workers, cfg)
+	if manualLayerPlan(cfg) {
+		cfg = applyManualWorkerLayersToConfig(cfg)
+		reachableWorkers = policyOnlineWorkers(cfg.Workers, cfg)
+		cfg.GPULayers = manualLayerTotal(cfg, reachableWorkers)
+		cfg.SplitMode = "layer"
+		s.addLog("manual layer plan active: %s (total GPU/RPC layers %d)", layerPlanSummary(cfg, reachableWorkers), cfg.GPULayers)
+		s.mu.Lock()
+		s.config.GPULayers = cfg.GPULayers
+		s.config.SplitMode = cfg.SplitMode
+		s.config.CoordinatorLocal = cfg.CoordinatorLocal
+		s.config.CoordinatorLayers = cfg.CoordinatorLayers
+		s.mu.Unlock()
+		_ = saveConfig(cfg)
+	}
 	s.cleanupStaleLlamaProcess("coordinator", cfg.APIPort)
 	if port, changed := firstFreePort(cfg.APIPort); changed {
 		s.addLog("coordinator API port %d is busy; using %d", cfg.APIPort, port)
@@ -2469,9 +3235,7 @@ func (s *AppState) startCoordinatorProcess(cfg Config, resetFallback bool) error
 	if strings.EqualFold(cfg.ComputeMode, "cpu") {
 		cfg.GPULayers = 0
 	}
-	if workerPolicy(cfg) == "use-all-safe" {
-		cfg.WeightedMode = true
-		cfg.MemoryMode = "safest"
+	if memoryMode(cfg) == "safest" {
 		if cfg.Batch > 64 {
 			cfg.Batch = 64
 		}
@@ -2481,35 +3245,7 @@ func (s *AppState) startCoordinatorProcess(cfg Config, resetFallback bool) error
 		if cfg.Parallel > 1 {
 			cfg.Parallel = 1
 		}
-		s.addLog("worker policy use-all-safe: all online workers included with conservative params")
-	}
-	if memoryMode(cfg) == "safest" {
-		if cfg.Batch > 128 {
-			cfg.Batch = 128
-		}
-		if cfg.UBatch > 64 {
-			cfg.UBatch = 64
-		}
-		if cfg.Parallel > 1 {
-			cfg.Parallel = 1
-		}
 		s.addLog("memory safest mode: clamped batch=%d ubatch=%d parallel=%d", cfg.Batch, cfg.UBatch, cfg.Parallel)
-	}
-	if cfg.WeightedMode && hasFragileMetalRuntime(reachableWorkers, hardwareInfo()) {
-		if cfg.Batch > 128 {
-			cfg.Batch = 128
-		}
-		if cfg.UBatch > 64 {
-			cfg.UBatch = 64
-		}
-		s.addLog("weighted runtime guard: fragile Metal detected, clamped batch=%d ubatch=%d; context kept at %d", cfg.Batch, cfg.UBatch, cfg.Context)
-	}
-	if cfg.WeightedMode {
-		plan := buildWeightedPlan(cfg, reachableWorkers, hardwareInfo())
-		// Let llama.cpp --fit choose the actual layer count and memory placement.
-		// Explicit -ngl/--tensor-split can conflict with --fit and crash/abort startup.
-		cfg.TensorSplit = ""
-		s.addLog("start weighted fit-first mode: recommended tensor-split/log-only %s", plan.TensorSplit)
 	}
 	args := []string{
 		"-m", cfg.ModelPath,
@@ -2522,11 +3258,12 @@ func (s *AppState) startCoordinatorProcess(cfg Config, resetFallback bool) error
 		"-b", strconv.Itoa(cfg.Batch),
 		"-ub", strconv.Itoa(cfg.UBatch),
 	}
-	if cfg.WeightedMode {
-		args = append(args, "-ngl", "auto", "-sm", "layer", "-fitt", weightedFitTargets(reachableWorkers, hardwareInfo()))
-	} else {
-		args = append(args, "-ngl", strconv.Itoa(cfg.GPULayers))
-	}
+	// Flash Attention, weight repacking, and auto-fit are fast/convenient when
+	// they work, but the Windows CUDA/RPC path is much more sensitive to backend
+	// and kernel mismatches. On some workers they crash rpc-server with "CUDA
+	// error: an illegal memory access" / malformed RPC response even when VRAM is
+	// half empty. Default to the safer path.
+	args = append(args, "-ngl", strconv.Itoa(cfg.GPULayers), "-sm", splitMode(cfg), "-fa", "off", "--no-repack", "--fit", "off")
 	switch memoryMode(cfg) {
 	case "normal":
 		args = append(args, "--mmap")
@@ -2537,14 +3274,36 @@ func (s *AppState) startCoordinatorProcess(cfg Config, resetFallback bool) error
 		args = append(args, "--mmap")
 		s.addLog("memory mode: safest mmap + small batch")
 	}
-	if !cfg.WeightedMode && strings.TrimSpace(cfg.TensorSplit) != "" {
-		args = append(args, "--tensor-split", strings.TrimSpace(cfg.TensorSplit))
+	if !cfg.CoordinatorLocal && len(reachableWorkers) == 0 {
+		// A coordinator with no reachable RPC workers must still be able to run
+		// locally. Older configs (and JSON bool zero-values) can leave this false,
+		// which made Start look like a no-op in the TUI when workers were absent.
+		cfg.CoordinatorLocal = true
+		s.mu.Lock()
+		s.config.CoordinatorLocal = true
+		s.mu.Unlock()
+		_ = saveConfig(cfg)
+		s.addLog("no reachable RPC workers; enabling local coordinator compute")
+	}
+	effectiveSplit := coordinatorTensorSplit(cfg, reachableWorkers)
+	if effectiveSplit != "" {
+		args = append(args, "--tensor-split", effectiveSplit)
+		if !cfg.CoordinatorLocal {
+			s.addLog("coordinator local compute disabled; tensor split forced to %s", effectiveSplit)
+		}
 	}
 	startedRPC := ""
 	if rpc := rpcList(reachableWorkers); rpc != "" {
 		args = append(args, "--rpc", rpc)
+		if !cfg.CoordinatorLocal {
+			args = append(args, "--device", rpcDeviceList(len(reachableWorkers)))
+			s.addLog("coordinator local compute disabled; using RPC devices only")
+		}
 		startedRPC = rpc
 		s.addLog("coordinator using %d online RPC worker(s): %s", len(reachableWorkers), rpc)
+		if cfg.GPULayers == 0 {
+			s.addLog("RPC workers connected but idle: GPU/RPC layers is 0; set GPU/RPC layers > 0 to offload work")
+		}
 	} else if len(cfg.Workers) > 0 {
 		s.addLog("coordinator starting without RPC workers: none reachable right now")
 	}
@@ -2595,11 +3354,18 @@ func (s *AppState) handleStopCoordinator(w http.ResponseWriter, r *http.Request)
 
 func (s *AppState) handleCheckWorkers(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
+	cfg := s.config
+	if isWorkerRole(cfg) {
+		workers := append([]Worker(nil), cfg.Workers...)
+		s.mu.Unlock()
+		writeJSON(w, workers)
+		return
+	}
 	workers := append([]Worker(nil), s.config.Workers...)
 	s.mu.Unlock()
 	workers = s.classifyWorkers(workers, 650*time.Millisecond)
 	s.mu.Lock()
-	cfg := s.config
+	cfg = s.config
 	cfg.Workers = workers
 	s.config = cfg
 	s.mu.Unlock()
@@ -2609,9 +3375,29 @@ func (s *AppState) handleCheckWorkers(w http.ResponseWriter, r *http.Request) {
 
 func (s *AppState) workerStatuses() []Worker {
 	s.mu.Lock()
-	workers := append([]Worker(nil), s.config.Workers...)
+	cfg := s.config
 	s.mu.Unlock()
-	return s.classifyWorkers(workers, 160*time.Millisecond)
+	return s.workerStatusesFor(cfg)
+}
+
+func (s *AppState) workerStatusesFor(cfg Config) []Worker {
+	workers := append([]Worker(nil), cfg.Workers...)
+	if !isCoordinatorRole(cfg) {
+		return workers
+	}
+	s.mu.Lock()
+	if !s.workerStatusAt.IsZero() && time.Since(s.workerStatusAt) < 5*time.Second && len(s.workerStatusCache) == len(workers) {
+		cached := append([]Worker(nil), s.workerStatusCache...)
+		s.mu.Unlock()
+		return cached
+	}
+	s.mu.Unlock()
+	classified := s.classifyWorkers(workers, 160*time.Millisecond)
+	s.mu.Lock()
+	s.workerStatusCache = append([]Worker(nil), classified...)
+	s.workerStatusAt = time.Now()
+	s.mu.Unlock()
+	return classified
 }
 
 func (s *AppState) classifyWorkers(workers []Worker, timeout time.Duration) []Worker {
@@ -2766,7 +3552,7 @@ func (s *AppState) installDepsWithOutput(force bool, console io.Writer) {
 		consolef("installed package not ready for requested mode %s: %s", st.Mode, st.Reason)
 	}
 	if runtime.GOOS == "windows" {
-		consolef("Using Windows prebuilt package…")
+		consolef(terminalText("Using Windows prebuilt package…"))
 		if err := s.installWindowsPrebuilt(cfg, force); err != nil {
 			s.addLog("install failed: %v", err)
 			consolef("install failed: %v", err)
@@ -3146,218 +3932,6 @@ func (s *AppState) handleOptimize(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, rec)
 }
 
-func hasFragileMetalRuntime(workers []Worker, local HardwareInfo) bool {
-	if local.OS == "darwin" && strings.Contains(strings.ToLower(local.Backend), "metal") && local.RAMBytes <= 24*1024*1024*1024 {
-		return true
-	}
-	for _, wk := range workers {
-		if wk.OS == "darwin" && strings.Contains(strings.ToLower(wk.Backend), "metal") && wk.RAMBytes <= 12*1024*1024*1024 {
-			return true
-		}
-	}
-	return false
-}
-
-func weightedFitTargets(workers []Worker, local HardwareInfo) string {
-	// One margin value per visible device: local Metal/CPU devices plus all RPC devices.
-	// Higher margin on fragile 8GB Apple Silicon workers prevents Metal OOM; lower margin on CUDA uses more VRAM.
-	targets := []string{}
-	if local.OS == "darwin" && strings.Contains(strings.ToLower(local.Backend), "metal") {
-		// Coordinator Metal needs a large reserve; otherwise model can load but decode OOMs.
-		// When RPC workers are online, reserve even more local memory so llama.cpp
-		// is biased to place layers on workers instead of keeping everything on the coordinator.
-		if len(workers) > 0 {
-			targets = append(targets, "8192")
-		} else {
-			targets = append(targets, "4096")
-		}
-	}
-	// CPU/BLAS local device, keep high margin so it is not preferred for model weights unless needed.
-	targets = append(targets, "4096")
-	for _, wk := range workers {
-		backend := strings.ToLower(wk.Backend)
-		ramGB := float64(wk.RAMBytes) / 1024 / 1024 / 1024
-		switch {
-		case strings.Contains(backend, "cuda"):
-			targets = append(targets, "1024")
-		case strings.Contains(backend, "cpu"):
-			targets = append(targets, "8192")
-		case strings.Contains(backend, "metal") && ramGB <= 10:
-			targets = append(targets, "8192", "8192")
-		case strings.Contains(backend, "metal"):
-			targets = append(targets, "4096", "8192")
-		default:
-			targets = append(targets, "4096")
-		}
-	}
-	return strings.Join(targets, ",")
-}
-
-type WeightedWorkerPlan struct {
-	Name     string  `json:"name"`
-	Host     string  `json:"host"`
-	Backend  string  `json:"backend"`
-	RAMGB    float64 `json:"ramGB"`
-	VRAMGB   float64 `json:"vramGB"`
-	UsableGB float64 `json:"usableGB"`
-	Weight   float64 `json:"weight"`
-	SharePct float64 `json:"sharePct"`
-	Status   string  `json:"status"`
-}
-
-type WeightedPlan struct {
-	Context     int                  `json:"context"`
-	GPULayers   int                  `json:"gpuLayers"`
-	Threads     int                  `json:"threads"`
-	Parallel    int                  `json:"parallel"`
-	Batch       int                  `json:"batch"`
-	UBatch      int                  `json:"uBatch"`
-	TensorSplit string               `json:"tensorSplit"`
-	TotalWeight float64              `json:"totalWeight"`
-	Workers     []WeightedWorkerPlan `json:"workers"`
-	Reason      string               `json:"reason"`
-}
-
-func (s *AppState) handleAutoWeighted(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	cfg := s.config
-	s.mu.Unlock()
-	workers := s.classifyWorkers(append([]Worker(nil), cfg.Workers...), 650*time.Millisecond)
-	plan := buildWeightedPlan(cfg, workers, hardwareInfo())
-	cfg.Context = plan.Context
-	cfg.GPULayers = plan.GPULayers
-	cfg.WeightedMode = true
-	cfg.Threads = plan.Threads
-	cfg.Parallel = plan.Parallel
-	cfg.Batch = plan.Batch
-	cfg.UBatch = plan.UBatch
-	cfg.TensorSplit = ""
-	cfg.Workers = workers
-	s.mu.Lock()
-	s.config = cfg
-	s.mu.Unlock()
-	_ = saveConfig(cfg)
-	s.addLog("auto weighted: ctx=%d batch=%d ubatch=%d parallel=%d fit-first recommended-split=%s", plan.Context, plan.Batch, plan.UBatch, plan.Parallel, plan.TensorSplit)
-	for _, wk := range plan.Workers {
-		s.addLog("auto weighted worker: %s %s weight=%.2f share=%.1f%% usable=%.1fGB", wk.Name, wk.Host, wk.Weight, wk.SharePct, wk.UsableGB)
-	}
-	writeJSON(w, plan)
-}
-
-func buildWeightedPlan(cfg Config, workers []Worker, local HardwareInfo) WeightedPlan {
-	items := []WeightedWorkerPlan{}
-	localWorker := Worker{Name: local.Hostname + " (coordinator)", Host: "local", OK: true, Status: "local", OS: local.OS, Arch: local.Arch, RAMBytes: local.RAMBytes, VRAMBytes: local.VRAMBytes, Backend: local.Backend, Threads: local.CPUCount}
-	items = append(items, weightedItem(localWorker, true))
-	for _, wk := range workers {
-		if wk.Status == "offline" || (!wk.OK && wk.Status == "") {
-			continue
-		}
-		items = append(items, weightedItem(wk, false))
-	}
-	var total float64
-	for _, it := range items {
-		if it.Weight < 0.25 {
-			it.Weight = 0.25
-		}
-		total += it.Weight
-	}
-	splits := []string{}
-	for i := range items {
-		if total > 0 {
-			items[i].SharePct = items[i].Weight / total * 100
-		}
-		splits = append(splits, fmt.Sprintf("%.2f", items[i].Weight))
-	}
-	usable := 0.0
-	for _, it := range items {
-		usable += it.UsableGB
-	}
-	ctx := cfg.Context
-	if ctx == 0 {
-		ctx = 4096
-	}
-	if usable < 18 && ctx > 4096 {
-		ctx = 4096
-	} else if usable < 32 && ctx > 8192 {
-		ctx = 8192
-	} else if usable >= 48 && ctx < 8192 {
-		ctx = 8192
-	}
-	batch := 512
-	ubatch := 256
-	if usable >= 32 {
-		batch = 768
-		ubatch = 384
-	}
-	if usable >= 48 {
-		batch = 1024
-		ubatch = 512
-	}
-	if hasWeakWorker(items) {
-		// Low-memory Metal/RPC devices can load the model but OOM during decode
-		// when n_batch is too high. Keep this very conservative.
-		if batch > 128 {
-			batch = 128
-		}
-		if ubatch > 64 {
-			ubatch = 64
-		}
-		if ctx > 4096 {
-			ctx = 4096
-		}
-	}
-	threads := max(1, local.CPUCount-2)
-	if local.CPUCount < 8 {
-		threads = max(1, local.CPUCount-1)
-	}
-	reason := fmt.Sprintf("weighted by real usable memory/backend across %d devices; low-memory Apple Silicon gets a small shard to avoid Metal OOM", len(items))
-	return WeightedPlan{Context: ctx, GPULayers: 0, Threads: threads, Parallel: 1, Batch: batch, UBatch: ubatch, TensorSplit: strings.Join(splits, ","), TotalWeight: total, Workers: items, Reason: reason + "; fit-first mode leaves layer placement to llama.cpp"}
-}
-
-func weightedItem(w Worker, local bool) WeightedWorkerPlan {
-	ramGB := float64(w.RAMBytes) / 1024 / 1024 / 1024
-	vramGB := float64(w.VRAMBytes) / 1024 / 1024 / 1024
-	usable := workerUsableGB(w)
-	mult := 0.45
-	backend := strings.ToLower(w.Backend)
-	switch {
-	case strings.Contains(backend, "cuda"):
-		mult = 1.15
-	case strings.Contains(backend, "metal"):
-		mult = 0.35
-		if ramGB <= 10 {
-			// 8GB Apple Silicon is very easy to OOM during RPC model load.
-			// Keep it in the cluster, but give it a tiny shard.
-			mult = 0.18
-		}
-	case strings.Contains(backend, "cpu") || strings.Contains(backend, "unknown"):
-		mult = 0.30
-	}
-	stability := w.Stability
-	if stability <= 0 {
-		stability = 1
-	}
-	if w.CrashCount > 0 {
-		// Keep the worker, but reduce its shard after crashes.
-		stability *= 1.0 / (1.0 + float64(w.CrashCount)*0.45)
-	}
-	if stability < 0.18 {
-		stability = 0.18
-	}
-	if local {
-		mult *= 0.85
-	}
-	weight := usable * mult * stability
-	if weight < 0.25 {
-		weight = 0.25
-	}
-	status := w.Status
-	if w.CrashCount > 0 {
-		status = fmt.Sprintf("%s; crashes=%d stability=%.2f", strings.TrimSpace(status), w.CrashCount, stability)
-	}
-	return WeightedWorkerPlan{Name: w.Name, Host: w.Host, Backend: w.Backend, RAMGB: ramGB, VRAMGB: vramGB, UsableGB: usable, Weight: weight, Status: status}
-}
-
 func workerUsableGB(w Worker) float64 {
 	ramGB := float64(w.RAMBytes) / 1024 / 1024 / 1024
 	vramGB := float64(w.VRAMBytes) / 1024 / 1024 / 1024
@@ -3400,15 +3974,6 @@ func workerUsableGB(w Worker) float64 {
 		return v
 	}
 	return 4
-}
-
-func hasWeakWorker(items []WeightedWorkerPlan) bool {
-	for _, it := range items {
-		if it.UsableGB > 0 && it.UsableGB < 5 {
-			return true
-		}
-	}
-	return false
 }
 
 type Recommendation struct {
@@ -4067,8 +4632,28 @@ func (s *AppState) handleModelDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "repo and file required", 400)
 		return
 	}
+	s.mu.Lock()
+	active := s.download.Active
+	s.mu.Unlock()
+	if active {
+		http.Error(w, "another model download is already running", 409)
+		return
+	}
 	go s.downloadModel(req.Repo, req.File)
 	writeJSON(w, map[string]bool{"started": true})
+}
+
+func (s *AppState) updateDownload(fn func(*DownloadStatus)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn(&s.download)
+	if s.download.Total > 0 {
+		s.download.Percent = int((s.download.Downloaded * 100) / s.download.Total)
+		if s.download.Percent > 100 {
+			s.download.Percent = 100
+		}
+	}
+	s.download.UpdatedMs = time.Now().UnixMilli()
 }
 
 func (s *AppState) downloadModel(repo, file string) {
@@ -4081,19 +4666,27 @@ func (s *AppState) downloadModel(repo, file string) {
 	tmp := dst + ".part"
 	u := "https://huggingface.co/" + repo + "/resolve/main/" + url.PathEscape(file)
 	u = strings.ReplaceAll(u, "%2F", "/")
+	started := time.Now()
+	s.updateDownload(func(d *DownloadStatus) {
+		*d = DownloadStatus{Active: true, Repo: repo, File: file, Path: dst, Status: "connecting", StartedMs: started.UnixMilli(), UpdatedMs: started.UnixMilli()}
+	})
 	s.addLog("download: %s", u)
 	resp, err := http.Get(u)
 	if err != nil {
+		s.updateDownload(func(d *DownloadStatus) { d.Active = false; d.Status = "failed"; d.Error = err.Error() })
 		s.addLog("download failed: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
+		s.updateDownload(func(d *DownloadStatus) { d.Active = false; d.Status = "failed"; d.Error = resp.Status })
 		s.addLog("download failed: %s", resp.Status)
 		return
 	}
+	s.updateDownload(func(d *DownloadStatus) { d.Status = "downloading"; d.Total = resp.ContentLength })
 	out, err := os.Create(tmp)
 	if err != nil {
+		s.updateDownload(func(d *DownloadStatus) { d.Active = false; d.Status = "failed"; d.Error = err.Error() })
 		s.addLog("download failed: %v", err)
 		return
 	}
@@ -4105,10 +4698,17 @@ func (s *AppState) downloadModel(repo, file string) {
 		n, er := resp.Body.Read(buf)
 		if n > 0 {
 			if _, ew := out.Write(buf[:n]); ew != nil {
+				s.updateDownload(func(d *DownloadStatus) { d.Active = false; d.Status = "failed"; d.Error = ew.Error() })
 				s.addLog("download failed: %v", ew)
 				return
 			}
 			got += int64(n)
+			elapsed := time.Since(started).Seconds()
+			speed := int64(0)
+			if elapsed > 0 {
+				speed = int64(float64(got) / elapsed)
+			}
+			s.updateDownload(func(d *DownloadStatus) { d.Downloaded = got; d.SpeedBps = speed; d.Status = "downloading" })
 		}
 		if time.Since(last) > 2*time.Second {
 			s.addLog("download %.1f MB: %s", float64(got)/1024/1024, filepath.Base(file))
@@ -4118,15 +4718,24 @@ func (s *AppState) downloadModel(repo, file string) {
 			break
 		}
 		if er != nil {
+			s.updateDownload(func(d *DownloadStatus) { d.Active = false; d.Status = "failed"; d.Error = er.Error() })
 			s.addLog("download failed: %v", er)
 			return
 		}
 	}
 	_ = out.Close()
 	if err := os.Rename(tmp, dst); err != nil {
+		s.updateDownload(func(d *DownloadStatus) { d.Active = false; d.Status = "failed"; d.Error = err.Error() })
 		s.addLog("download failed: %v", err)
 		return
 	}
+	s.updateDownload(func(d *DownloadStatus) {
+		d.Active = false
+		d.Status = "complete"
+		d.Downloaded = got
+		d.Percent = 100
+		d.SpeedBps = 0
+	})
 	s.addLog("download complete: %s", dst)
 }
 
@@ -4250,6 +4859,226 @@ func clearModelCache(root, selected string, keepSelected bool, onlyPath string) 
 	return removed, err
 }
 
+func (s *AppState) handleOpenAIRoot(w http.ResponseWriter, r *http.Request) {
+	setOpenAIHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	writeJSON(w, map[string]any{
+		"object":    "clusterkit.openai_compat",
+		"status":    "ok",
+		"endpoints": []string{"/v1/models", "/v1/chat/completions", "/v1/completions", "/v1/health"},
+	})
+}
+
+func (s *AppState) handleOpenAIHealth(w http.ResponseWriter, r *http.Request) {
+	setOpenAIHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	s.mu.Lock()
+	cfg := s.config
+	appPort := s.appPort
+	running := s.serverCmd != nil && s.serverCmd.Process != nil
+	load := s.serverLoad
+	s.mu.Unlock()
+	reachable := coordinatorPortReachable(cfg.APIPort)
+	status := "unavailable"
+	if running || reachable {
+		status = "ok"
+	}
+	writeJSON(w, map[string]any{
+		"status":               status,
+		"openaiBaseURL":        fmt.Sprintf("http://127.0.0.1:%d/v1", appPort),
+		"coordinatorAPI":       fmt.Sprintf("http://127.0.0.1:%d/v1", cfg.APIPort),
+		"coordinatorRunning":   running,
+		"coordinatorReachable": reachable,
+		"serverLoad":           load,
+		"model":                filepath.Base(cfg.ModelPath),
+	})
+}
+
+func coordinatorPortReachable(port int) bool {
+	if port <= 0 {
+		return false
+	}
+	return checkTCP("127.0.0.1", port, 220*time.Millisecond)
+}
+
+func (s *AppState) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
+	setOpenAIHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	s.mu.Lock()
+	cfg := s.config
+	s.mu.Unlock()
+	// Keep the public model id short and stable. Some chat surfaces put model ids
+	// into inline button callback payloads; long GGUF filenames can make the
+	// picker show "1 available" with no usable button.
+	writeJSON(w, openAIModelsResponse(cfg))
+}
+
+func openAIModelsResponse(cfg Config) map[string]any {
+	modelPath := strings.TrimSpace(cfg.ModelPath)
+	modelName := "clusterkit-local"
+	if modelPath != "" {
+		modelName = filepath.Base(modelPath)
+	}
+	return map[string]any{
+		"object": "list",
+		"data": []map[string]any{{
+			"id":       "clusterkit-local",
+			"object":   "model",
+			"created":  time.Now().Unix(),
+			"owned_by": "clusterkit",
+			"name":     modelName,
+		}},
+	}
+}
+
+func (s *AppState) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
+	s.handleOpenAIProxy(w, r, "/v1/chat/completions")
+}
+
+func (s *AppState) handleOpenAICompletions(w http.ResponseWriter, r *http.Request) {
+	s.handleOpenAIProxy(w, r, "/v1/completions")
+}
+
+func (s *AppState) handleOpenAIProxy(w http.ResponseWriter, r *http.Request, upstreamPath string) {
+	setOpenAIHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	s.mu.Lock()
+	port := s.config.APIPort
+	running := s.serverCmd != nil && s.serverCmd.Process != nil
+	if running {
+		s.serverLoad = "processing"
+	}
+	s.mu.Unlock()
+	if !running && !coordinatorPortReachable(port) {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "coordinator_unavailable", fmt.Sprintf("ClusterKit coordinator API is not reachable on 127.0.0.1:%d", port))
+		return
+	}
+	if !proxyOpenAIRequest(w, r, port, upstreamPath) {
+		s.mu.Lock()
+		if s.serverCmd != nil && s.serverCmd.Process != nil {
+			s.serverLoad = "unreachable"
+		}
+		s.mu.Unlock()
+	}
+}
+
+func proxyOpenAIRequest(w http.ResponseWriter, r *http.Request, port int, upstreamPath string) bool {
+	if port == 0 {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "coordinator_unavailable", "coordinator API port is not configured")
+		return false
+	}
+	upURL := "http://127.0.0.1:" + strconv.Itoa(port) + upstreamPath
+	if r.URL.RawQuery != "" {
+		upURL += "?" + r.URL.RawQuery
+	}
+	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, upURL, r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return false
+	}
+	copyProxyHeaders(upReq.Header, r.Header)
+	client := &http.Client{Timeout: 0}
+	resp, err := client.Do(upReq)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "coordinator_unavailable", "coordinator API unavailable: "+err.Error())
+		return false
+	}
+	defer resp.Body.Close()
+	for k, vals := range resp.Header {
+		low := strings.ToLower(k)
+		if low == "content-length" || low == "connection" || low == "keep-alive" || low == "transfer-encoding" {
+			continue
+		}
+		for _, v := range vals {
+			w.Header().Add(k, v)
+		}
+	}
+	setOpenAIHeaders(w)
+	w.WriteHeader(resp.StatusCode)
+	copyResponseBody(w, resp.Body)
+	return resp.StatusCode < 500
+}
+
+func copyResponseBody(w http.ResponseWriter, body io.Reader) {
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := body.Read(buf)
+		if n > 0 {
+			_, _ = w.Write(buf[:n])
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func copyProxyHeaders(dst, src http.Header) {
+	for k, vals := range src {
+		low := strings.ToLower(k)
+		switch low {
+		case "host", "content-length", "connection", "keep-alive", "transfer-encoding", "upgrade":
+			continue
+		}
+		for _, v := range vals {
+			dst.Add(k, v)
+		}
+	}
+	if dst.Get("Content-Type") == "" {
+		dst.Set("Content-Type", "application/json")
+	}
+}
+
+func setOpenAIHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+}
+
+func writeOpenAIError(w http.ResponseWriter, status int, code, message string) {
+	setOpenAIHeaders(w)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"type":    code,
+			"code":    code,
+		},
+	})
+}
+
 func (s *AppState) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Messages    []map[string]string `json:"messages"`
@@ -4264,16 +5093,16 @@ func (s *AppState) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	port := s.config.APIPort
+	cfg := s.config
+	port := cfg.APIPort
+	timeout := chatTimeoutDuration(cfg)
 	s.mu.Unlock()
-	body := map[string]any{
-		"model":       "local",
-		"messages":    req.Messages,
-		"temperature": req.Temperature,
-		"stream":      false,
+	body := chatCompletionBody(req.Messages, false, cfg)
+	if req.Temperature > 0 {
+		body["temperature"] = req.Temperature
 	}
 	b, _ := json.Marshal(body)
-	client := &http.Client{Timeout: 10 * time.Minute}
+	client := &http.Client{Timeout: timeout}
 	upReq, _ := http.NewRequestWithContext(r.Context(), "POST", "http://127.0.0.1:"+strconv.Itoa(port)+"/v1/chat/completions", strings.NewReader(string(b)))
 	upReq.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(upReq)
@@ -4312,7 +5141,9 @@ func (s *AppState) chatOnce(messages []map[string]string) (string, int, error) {
 		return "", 0, fmt.Errorf("messages required")
 	}
 	s.mu.Lock()
-	port := s.config.APIPort
+	cfg := s.config
+	port := cfg.APIPort
+	timeout := chatTimeoutDuration(cfg)
 	if s.serverCmd != nil && s.serverCmd.Process != nil {
 		s.serverLoad = "processing"
 	}
@@ -4325,15 +5156,10 @@ func (s *AppState) chatOnce(messages []map[string]string) (string, int, error) {
 		}
 		s.mu.Unlock()
 	}()
-	client := &http.Client{Timeout: 10 * time.Minute}
+	client := &http.Client{Timeout: timeout}
 	trimmed := false
 	for {
-		body := map[string]any{
-			"model":       "local",
-			"messages":    messages,
-			"temperature": 0.7,
-			"stream":      false,
-		}
+		body := chatCompletionBody(messages, false, cfg)
 		b, _ := json.Marshal(body)
 		upReq, _ := http.NewRequest("POST", "http://127.0.0.1:"+strconv.Itoa(port)+"/v1/chat/completions", strings.NewReader(string(b)))
 		upReq.Header.Set("Content-Type", "application/json")
@@ -4387,6 +5213,141 @@ func (s *AppState) chatOnce(messages []map[string]string) (string, int, error) {
 		}
 		return out.Choices[0].Message.Content, tokens, nil
 	}
+}
+
+func defaultChatMaxTokens(cfg Config) int {
+	if cfg.ChatMaxTokens > 0 {
+		return cfg.ChatMaxTokens
+	}
+	return 1200
+}
+
+func chatCompletionBody(messages []map[string]string, stream bool, cfg Config) map[string]any {
+	body := map[string]any{
+		"model":          "local",
+		"messages":       messages,
+		"temperature":    0.35,
+		"top_p":          0.9,
+		"repeat_penalty": 1.12,
+		"stop": []string{
+			"<|im_end|>",
+			"<|endoftext|>",
+			"<|end_of_text|>",
+			"</s>",
+		},
+		"stream": stream,
+	}
+	if !cfg.ChatNoTokenLimit {
+		body["max_tokens"] = defaultChatMaxTokens(cfg)
+	}
+	return body
+}
+
+func (s *AppState) chatStream(messages []map[string]string, ch chan<- tuiChatStreamMsg) {
+	defer close(ch)
+	if len(messages) == 0 {
+		ch <- tuiChatStreamMsg{Err: fmt.Errorf("messages required")}
+		return
+	}
+	s.mu.Lock()
+	cfg := s.config
+	port := cfg.APIPort
+	timeout := chatTimeoutDuration(cfg)
+	if s.serverCmd != nil && s.serverCmd.Process != nil {
+		s.serverLoad = "streaming"
+	}
+	s.mu.Unlock()
+	finalLoad := "ready"
+	defer func() {
+		s.mu.Lock()
+		if s.serverCmd != nil && s.serverCmd.Process != nil && (s.serverLoad == "streaming" || s.serverLoad == "processing") {
+			s.serverLoad = finalLoad
+		}
+		s.mu.Unlock()
+	}()
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	client := &http.Client{Timeout: timeout}
+	trimmed := false
+	var resp *http.Response
+	for {
+		body := chatCompletionBody(messages, true, cfg)
+		b, _ := json.Marshal(body)
+		upReq, _ := http.NewRequestWithContext(ctx, "POST", "http://127.0.0.1:"+strconv.Itoa(port)+"/v1/chat/completions", strings.NewReader(string(b)))
+		upReq.Header.Set("Content-Type", "application/json")
+		var err error
+		resp, err = client.Do(upReq)
+		if err != nil {
+			finalLoad = "unreachable"
+			ch <- tuiChatStreamMsg{Err: fmt.Errorf("coordinator API unavailable: %w", err), Ms: time.Since(start).Milliseconds()}
+			return
+		}
+		if resp.StatusCode < 300 {
+			break
+		}
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		text := cleanLlamaError(string(msg))
+		if isContextExceededError(text) {
+			next := trimOldestChatMessage(messages)
+			if len(next) < len(messages) {
+				messages = next
+				trimmed = true
+				continue
+			}
+		}
+		finalLoad = "error"
+		s.markChatComputeError(text)
+		ch <- tuiChatStreamMsg{Err: fmt.Errorf("%s", text), Ms: time.Since(start).Milliseconds()}
+		return
+	}
+	defer resp.Body.Close()
+	if trimmed {
+		s.addLog("chat context exceeded server limit; trimmed oldest messages and retried")
+	}
+	tokens := 0
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					Reasoning        string `json:"reasoning"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(data), &chunk) != nil || len(chunk.Choices) == 0 {
+			continue
+		}
+		delta := chunk.Choices[0].Delta
+		thought := delta.ReasoningContent
+		if thought == "" {
+			thought = delta.Reasoning
+		}
+		content := delta.Content
+		if thought == "" && content == "" {
+			continue
+		}
+		tokens++
+		ch <- tuiChatStreamMsg{Content: content, Thought: thought, Tokens: tokens, Ms: time.Since(start).Milliseconds()}
+	}
+	if err := scanner.Err(); err != nil {
+		finalLoad = "error"
+		ch <- tuiChatStreamMsg{Err: err, Tokens: tokens, Ms: time.Since(start).Milliseconds()}
+		return
+	}
+	ch <- tuiChatStreamMsg{Done: true, Tokens: tokens, Ms: time.Since(start).Milliseconds()}
 }
 
 func isContextExceededError(s string) bool {
@@ -4456,16 +5417,16 @@ func (s *AppState) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	port := s.config.APIPort
+	cfg := s.config
+	port := cfg.APIPort
+	timeout := chatTimeoutDuration(cfg)
 	s.mu.Unlock()
-	body := map[string]any{
-		"model":       "local",
-		"messages":    req.Messages,
-		"temperature": req.Temperature,
-		"stream":      true,
+	body := chatCompletionBody(req.Messages, true, cfg)
+	if req.Temperature > 0 {
+		body["temperature"] = req.Temperature
 	}
 	b, _ := json.Marshal(body)
-	client := &http.Client{Timeout: 10 * time.Minute}
+	client := &http.Client{Timeout: timeout}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -4527,22 +5488,34 @@ func (s *AppState) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					Reasoning        string `json:"reasoning"`
 				} `json:"delta"`
 			} `json:"choices"`
 		}
 		if json.Unmarshal([]byte(data), &chunk) != nil || len(chunk.Choices) == 0 {
 			continue
 		}
-		content := chunk.Choices[0].Delta.Content
-		if content == "" {
+		delta := chunk.Choices[0].Delta
+		thought := delta.ReasoningContent
+		if thought == "" {
+			thought = delta.Reasoning
+		}
+		content := delta.Content
+		if thought == "" && content == "" {
 			continue
 		}
 		if firstToken.IsZero() {
 			firstToken = time.Now()
 		}
 		tokens++
-		send("token", map[string]any{"content": content, "tokens": tokens, "elapsedMs": time.Since(started).Milliseconds()})
+		if thought != "" {
+			send("thought", map[string]any{"content": thought, "tokens": tokens, "elapsedMs": time.Since(started).Milliseconds()})
+		}
+		if content != "" {
+			send("token", map[string]any{"content": content, "tokens": tokens, "elapsedMs": time.Since(started).Milliseconds()})
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		send("error", map[string]string{"message": err.Error()})
@@ -5014,18 +5987,204 @@ func stableOnlineWorkers(workers []Worker) []Worker {
 }
 
 func policyOnlineWorkers(workers []Worker, cfg Config) []Worker {
-	switch workerPolicy(cfg) {
-	case "stable-only":
-		return stableOnlineWorkers(workers)
-	case "force-all", "use-all-safe":
-		online := onlineWorkers(workers)
-		if workerPolicy(cfg) == "use-all-safe" {
-			appendAppLog(fmt.Sprintf("use-all-safe RPC workers: %d online", len(online)))
+	online := onlineWorkers(workers)
+	filtered := make([]Worker, 0, len(online))
+	skipped := []string{}
+	manualLayers := cfg.CoordinatorLayers > 0 || manualWorkerLayers(online)
+	for _, wk := range online {
+		if wk.Disabled {
+			skipped = append(skipped, firstNonEmpty(wk.Name, wk.Host))
+			continue
 		}
-		return online
-	default:
-		return stableOnlineWorkers(workers)
+		if manualLayers && wk.Layers <= 0 {
+			skipped = append(skipped, fmt.Sprintf("%s(layers=0)", firstNonEmpty(wk.Name, wk.Host)))
+			continue
+		}
+		filtered = append(filtered, wk)
 	}
+	if len(skipped) > 0 {
+		appendAppLog("skipping disabled RPC workers: " + strings.Join(skipped, ", "))
+	}
+	return filtered
+}
+
+func manualWorkerLayers(workers []Worker) bool {
+	for _, wk := range workers {
+		if !wk.Disabled && wk.Layers > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func manualLayerPlan(cfg Config) bool {
+	return cfg.CoordinatorLayers > 0 || manualWorkerLayers(cfg.Workers)
+}
+
+func workerLayerTotal(workers []Worker) int {
+	total := 0
+	for _, wk := range workers {
+		if !wk.Disabled && wk.Layers > 0 {
+			total += wk.Layers
+		}
+	}
+	return total
+}
+
+func manualLayerTotal(cfg Config, workers []Worker) int {
+	total := workerLayerTotal(workers)
+	if cfg.CoordinatorLayers > 0 {
+		total += cfg.CoordinatorLayers
+	}
+	return total
+}
+
+func applyManualWorkerLayersToConfig(cfg Config) Config {
+	if !manualLayerPlan(cfg) {
+		return cfg
+	}
+	cfg.GPULayers = manualLayerTotal(cfg, cfg.Workers)
+	cfg.SplitMode = "layer"
+	cfg.CoordinatorLocal = cfg.CoordinatorLayers > 0
+	return cfg
+}
+
+func clearManualWorkerLayers(cfg Config) Config {
+	cfg.CoordinatorLayers = 0
+	for i := range cfg.Workers {
+		cfg.Workers[i].Layers = 0
+		cfg.Workers[i].SplitWeight = 0
+	}
+	return cfg
+}
+
+func workerLayerPlanSummary(workers []Worker) string {
+	if !manualWorkerLayers(workers) {
+		return "off"
+	}
+	parts := []string{}
+	for _, wk := range workers {
+		if wk.Disabled || wk.Layers <= 0 {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=%d", short(firstNonEmpty(wk.Name, wk.Host), 12), wk.Layers))
+	}
+	return strings.Join(parts, ",")
+}
+
+func layerPlanSummary(cfg Config, workers []Worker) string {
+	if !manualLayerPlan(cfg) && !manualWorkerLayers(workers) {
+		return "off"
+	}
+	parts := []string{}
+	if cfg.CoordinatorLayers > 0 {
+		parts = append(parts, fmt.Sprintf("LOCAL=%d", cfg.CoordinatorLayers))
+	}
+	for _, wk := range workers {
+		if wk.Disabled || wk.Layers <= 0 {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=%d", short(firstNonEmpty(wk.Name, wk.Host), 12), wk.Layers))
+	}
+	if len(parts) == 0 {
+		return "off"
+	}
+	return strings.Join(parts, ",")
+}
+
+func workerLayerTensorSplit(workers []Worker) string {
+	parts := []string{}
+	for _, wk := range workers {
+		if wk.Disabled || wk.Layers <= 0 {
+			continue
+		}
+		parts = append(parts, strconv.Itoa(wk.Layers))
+	}
+	return strings.Join(parts, ",")
+}
+
+func layerTensorSplit(cfg Config, workers []Worker) string {
+	parts := []string{}
+	if cfg.CoordinatorLayers > 0 {
+		parts = append(parts, strconv.Itoa(cfg.CoordinatorLayers))
+	}
+	if cfg.CoordinatorLayers == 0 && cfg.CoordinatorLocal {
+		parts = append(parts, "0")
+	}
+	for _, wk := range workers {
+		if wk.Disabled || wk.Layers <= 0 {
+			continue
+		}
+		parts = append(parts, strconv.Itoa(wk.Layers))
+	}
+	return strings.Join(parts, ",")
+}
+
+func equalTensorSplit(workers []Worker) string {
+	parts := []string{}
+	for _, wk := range workers {
+		if wk.Disabled {
+			continue
+		}
+		parts = append(parts, "1")
+	}
+	return strings.Join(parts, ",")
+}
+
+func usableTensorSplit(workers []Worker) string {
+	parts := []string{}
+	for _, wk := range workers {
+		if wk.Disabled {
+			continue
+		}
+		gb := workerUsableGB(wk)
+		if gb <= 0 {
+			gb = 1
+		}
+		parts = append(parts, strconv.FormatFloat(gb, 'f', 1, 64))
+	}
+	return strings.Join(parts, ",")
+}
+
+func displayTensorSplit(cfg Config) string {
+	if v := strings.TrimSpace(cfg.TensorSplit); v != "" {
+		return v
+	}
+	if manualLayerPlan(cfg) {
+		return "from layer plan: " + layerTensorSplit(cfg, cfg.Workers)
+	}
+	return "auto"
+}
+
+func nextTensorSplitPreset(cfg Config, dir int) string {
+	presets := []string{""}
+	if v := equalTensorSplit(cfg.Workers); v != "" {
+		presets = appendUnique(presets, v)
+	}
+	if v := usableTensorSplit(cfg.Workers); v != "" {
+		presets = appendUnique(presets, v)
+	}
+	if v := layerTensorSplit(cfg, cfg.Workers); v != "" {
+		presets = appendUnique(presets, v)
+	}
+	current := strings.TrimSpace(cfg.TensorSplit)
+	idx := 0
+	for i, v := range presets {
+		if v == current {
+			idx = i
+			break
+		}
+	}
+	return presets[(idx+dir+len(presets))%len(presets)]
+}
+
+func appendUnique(vals []string, v string) []string {
+	for _, existing := range vals {
+		if existing == v {
+			return vals
+		}
+	}
+	return append(vals, v)
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -5050,6 +6209,93 @@ func rpcList(workers []Worker) string {
 		parts = append(parts, fmt.Sprintf("%s:%d", wk.Host, p))
 	}
 	return strings.Join(parts, ",")
+}
+
+func rpcDeviceList(n int) string {
+	parts := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		parts = append(parts, fmt.Sprintf("RPC%d", i))
+	}
+	return strings.Join(parts, ",")
+}
+
+func coordinatorTensorSplit(cfg Config, workers []Worker) string {
+	manual := strings.TrimSpace(cfg.TensorSplit)
+	if len(workers) == 0 {
+		return manual
+	}
+	if manualLayerPlan(cfg) {
+		return layerTensorSplit(cfg, workers)
+	}
+	manualWorkerWeights := false
+	manualLayers := manualWorkerLayers(workers)
+	for _, wk := range workers {
+		if wk.SplitWeight > 0 {
+			manualWorkerWeights = true
+			break
+		}
+	}
+	// Per-worker weights map cleanly to RPC-only mode: every split entry belongs
+	// to one RPC device. When the coordinator also computes locally, the tensor
+	// split also needs a local-device entry, so keep using the global tensorSplit
+	// field for that advanced/manual case.
+	if cfg.CoordinatorLocal {
+		return manual
+	}
+	if manualLayers {
+		weights := make([]string, 0, len(workers))
+		for _, wk := range workers {
+			if wk.Layers <= 0 {
+				continue
+			}
+			weights = append(weights, strconv.Itoa(wk.Layers))
+		}
+		return strings.Join(weights, ",")
+	}
+	if manualWorkerWeights {
+		weights := make([]string, 0, len(workers))
+		for _, wk := range workers {
+			weight := wk.SplitWeight
+			if weight <= 0 {
+				weight = workerUsableGB(wk)
+			}
+			if weight <= 0 {
+				weight = 1
+			}
+			weights = append(weights, strconv.FormatFloat(weight, 'f', 1, 64))
+		}
+		return strings.Join(weights, ",")
+	}
+	weights := splitTensorWeights(manual)
+	if len(weights) == 0 {
+		weights = make([]string, 0, len(workers))
+		for _, wk := range workers {
+			gb := workerUsableGB(wk)
+			if gb <= 0 {
+				gb = 1
+			}
+			weights = append(weights, strconv.FormatFloat(gb, 'f', 1, 64))
+		}
+	} else if len(weights) == len(workers)+1 {
+		weights = weights[1:]
+	}
+	return strings.Join(weights, ",")
+}
+
+func splitTensorWeights(v string) []string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	fields := strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' })
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		f = strings.TrimSpace(f)
+		if f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func isAuxModelFile(path string) bool {
